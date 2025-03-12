@@ -56,10 +56,12 @@ training:
   early_stopping_patience: 5
   scheduler: "constant"  # Options: "linear", "cosine", "constant"
   use_fp16: false
+  gradient_accumulation_steps: 4
 
 # Tokenizer configuration
 tokenizer:
-  type: "character"  # Options: "character", "bpe", "word"
+  type: "bpe"  # Change from "character" to "bpe"
+  vocab_size: 1000  # Start with 1000, experiment up to 5000
   # For character tokenizer, vocab_size is determined by the alphabet plus special tokens
   # For BPE tokenizer, you would set an explicit vocab_size (e.g., 1000-5000)
   # Estonian alphabet + digits + punctuation + special tokens requires ~60 tokens
