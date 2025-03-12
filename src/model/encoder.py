@@ -318,10 +318,10 @@ class XLSREncoder(nn.Module):
                 streaming_layer.attention.out_proj.bias.data = layer.attention.out_proj.bias.data.clone()
                 
                 # Copy feed forward weights
-                streaming_layer.feed_forward[0].weight.data = layer.feed_forward[0].weight.data.clone()
-                streaming_layer.feed_forward[0].bias.data = layer.feed_forward[0].bias.data.clone()
-                streaming_layer.feed_forward[3].weight.data = layer.feed_forward[3].weight.data.clone()
-                streaming_layer.feed_forward[3].bias.data = layer.feed_forward[3].bias.data.clone()
+                streaming_layer.feed_forward[0].weight.data = layer.feed_forward.intermediate_dense.weight.data.clone()
+                streaming_layer.feed_forward[0].bias.data = layer.feed_forward.intermediate_dense.bias.data.clone()
+                streaming_layer.feed_forward[3].weight.data = layer.feed_forward.output_dense.weight.data.clone()
+                streaming_layer.feed_forward[3].bias.data = layer.feed_forward.output_dense.bias.data.clone()
                 
                 # Copy layer norms
                 streaming_layer.layer_norm.weight.data = layer.layer_norm.weight.data.clone()
