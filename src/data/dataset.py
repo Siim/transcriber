@@ -142,7 +142,7 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         speaker_ids[i] = sample["speaker_id"]
     
     return {
-        "input_values": input_values,
+        "input_values": input_values.squeeze(1),  # Change from [batch, 1, length] to [batch, length]
         "attention_mask": attention_mask,
         "labels": labels,
         "label_lengths": label_lengths,
