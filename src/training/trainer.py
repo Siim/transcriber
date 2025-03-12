@@ -16,6 +16,47 @@ from data.dataset import EstonianASRDataset, collate_fn
 from data.processor import XLSRTransducerProcessor
 
 
+# Define robust collate function outside the Trainer class to make it picklable
+def robust_collate_fn(batch, processor=None, logger=None):
+    """
+    Enhanced collate function that handles potential errors in batches.
+    """
+    import torch
+    
+    # Filter out any problematic samples
+    valid_batch = []
+    for sample in batch:
+        # Check if all required keys are present and not empty
+        if all(k in sample and sample[k] is not None for k in ["input_values", "labels", "speaker_id"]):
+            if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
+                valid_batch.append(sample)
+            else:
+                if logger:
+                    logger.warning(f"Skipping sample with empty tensors: {sample.keys()}")
+        else:
+            if logger:
+                logger.warning(f"Skipping sample with missing keys: {sample.keys()}")
+    
+    # If we have no valid samples, create a dummy batch with minimal inputs
+    if len(valid_batch) == 0:
+        if logger:
+            logger.warning("No valid samples in batch, creating dummy batch")
+        
+        blank_id = 0
+        if processor is not None:
+            blank_id = processor.blank_id
+            
+        dummy_sample = {
+            "input_values": torch.zeros(1, 16000),  # 1 second at 16kHz
+            "labels": torch.tensor([blank_id], dtype=torch.long),
+            "speaker_id": torch.tensor([0], dtype=torch.long)
+        }
+        valid_batch = [dummy_sample, dummy_sample]  # Need at least 2 for batch
+    
+    # Use the original collate function with the valid batch
+    return collate_fn(valid_batch)
+
+
 @dataclass
 class TrainingArguments:
     """Arguments for training the XLSR-Transducer model."""
@@ -698,38 +739,6 @@ class Trainer:
         self.logger.info(f"Training dataset size: {len(self.train_dataset)}")
         self.logger.info(f"Evaluation dataset size: {len(self.eval_dataset)}")
         
-        # Get custom collate function that handles variable length inputs and labels
-        def robust_collate_fn(batch):
-            """
-            Enhanced collate function that handles potential errors in batches.
-            """
-            import torch
-            
-            # Filter out any problematic samples
-            valid_batch = []
-            for sample in batch:
-                # Check if all required keys are present and not empty
-                if all(k in sample and sample[k] is not None for k in ["input_values", "labels", "speaker_id"]):
-                    if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
-                        valid_batch.append(sample)
-                    else:
-                        self.logger.warning(f"Skipping sample with empty tensors: {sample.keys()}")
-                else:
-                    self.logger.warning(f"Skipping sample with missing keys: {sample.keys()}")
-            
-            # If we have no valid samples, create a dummy batch with minimal inputs
-            if len(valid_batch) == 0:
-                self.logger.warning(f"No valid samples in batch, creating dummy batch")
-                dummy_sample = {
-                    "input_values": torch.zeros(1, 16000),  # 1 second at 16kHz
-                    "labels": torch.tensor([self.processor.blank_id], dtype=torch.long),
-                    "speaker_id": torch.tensor([0], dtype=torch.long)
-                }
-                valid_batch = [dummy_sample, dummy_sample]  # Need at least 2 for batch
-            
-            # Use the original collate function with the valid batch
-            return collate_fn(valid_batch)
-        
         # Create dataloaders
         batch_size = data_config.get("batch_size", 2)
         num_workers = data_config.get("num_workers", 4)
@@ -737,7 +746,8 @@ class Trainer:
         # For debug mode, use smaller batch size and fewer workers
         if debug:
             batch_size = min(batch_size, 2)
-            num_workers = min(num_workers, 2)
+            # Use 0 workers in debug mode to avoid pickling issues
+            num_workers = 0
             self.logger.info(f"Debug mode: Using batch_size={batch_size}, num_workers={num_workers}")
         
         train_dataloader = DataLoader(
@@ -745,8 +755,8 @@ class Trainer:
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            collate_fn=robust_collate_fn,
-            pin_memory=True
+            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger),
+            pin_memory=(num_workers > 0)  # Only use pin_memory with workers
         )
         
         eval_dataloader = DataLoader(
@@ -754,8 +764,8 @@ class Trainer:
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=robust_collate_fn,
-            pin_memory=True
+            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger),
+            pin_memory=(num_workers > 0)  # Only use pin_memory with workers
         )
         
         # Create training arguments

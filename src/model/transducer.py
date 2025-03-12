@@ -90,75 +90,114 @@ class XLSRTransducer(nn.Module):
             print("WARNING: NaN values detected in model input!")
             input_values = torch.nan_to_num(input_values, nan=0.0)
         
-        # Encoder forward pass
-        encoder_outputs = self.encoder(
-            input_values=input_values,
-            attention_mask=attention_mask,
-        )
+        # Extra diagnostic information
+        print(f"Input values shape: {input_values.shape}, device: {input_values.device}")
+        if attention_mask is not None:
+            print(f"Attention mask shape: {attention_mask.shape}, device: {attention_mask.device}")
+        if labels is not None:
+            print(f"Labels shape: {labels.shape}, device: {labels.device}")
+        if label_lengths is not None:
+            print(f"Label lengths shape: {label_lengths.shape}, device: {label_lengths.device}")
         
-        # Get encoder outputs
-        encoder_hidden_states = encoder_outputs["last_hidden_state"]
-        
-        # Check for NaN values in encoder outputs
-        if torch.isnan(encoder_hidden_states).any():
-            print("WARNING: NaN values detected in encoder hidden states!")
-            encoder_hidden_states = torch.nan_to_num(encoder_hidden_states, nan=0.0)
-        
-        # Predictor forward pass (if labels are provided)
-        if labels is not None and label_lengths is not None:
-            # Validate label_lengths to prevent CUDA errors
-            if (label_lengths <= 0).any():
-                print("WARNING: Some label lengths are zero or negative. Setting them to 1.")
-                label_lengths = torch.clamp(label_lengths, min=1)
+        try:
+            # Encoder forward pass
+            encoder_outputs = self.encoder(
+                input_values=input_values,
+                attention_mask=attention_mask,
+            )
+            
+            # Get encoder outputs
+            encoder_hidden_states = encoder_outputs["last_hidden_state"]
+            
+            # Check for NaN values in encoder outputs
+            if torch.isnan(encoder_hidden_states).any():
+                print("WARNING: NaN values detected in encoder hidden states!")
+                encoder_hidden_states = torch.nan_to_num(encoder_hidden_states, nan=0.0)
+            
+            # Predictor forward pass (if labels are provided)
+            if labels is not None and label_lengths is not None:
+                # Validate and fix label_lengths
+                device = labels.device
                 
-            # Ensure label_lengths doesn't exceed labels.size(1)
-            if (label_lengths > labels.size(1)).any():
-                print(f"WARNING: Some label lengths exceed labels dimension {labels.size(1)}. Clamping.")
-                label_lengths = torch.clamp(label_lengths, max=labels.size(1))
+                # Create a new tensor on CPU first for safety
+                fixed_label_lengths = label_lengths.detach().cpu()
                 
-            # Shift labels right by adding blank at the beginning
-            blank_tensor = torch.full(
-                (labels.size(0), 1), self.blank_id, dtype=labels.dtype, device=labels.device
-            )
-            predictor_labels = torch.cat([blank_tensor, labels[:, :-1]], dim=1)
+                # Ensure label_lengths is at least 1
+                fixed_label_lengths = torch.clamp(fixed_label_lengths, min=1)
+                
+                # Ensure label_lengths doesn't exceed labels.size(1)
+                fixed_label_lengths = torch.clamp(fixed_label_lengths, max=labels.size(1))
+                
+                # Move back to the original device
+                fixed_label_lengths = fixed_label_lengths.to(device)
+                
+                print(f"After fixing: Label lengths min: {fixed_label_lengths.min().item()}, max: {fixed_label_lengths.max().item()}")
+                
+                # Shift labels right by adding blank at the beginning
+                blank_tensor = torch.full(
+                    (labels.size(0), 1), self.blank_id, dtype=labels.dtype, device=labels.device
+                )
+                predictor_labels = torch.cat([blank_tensor, labels[:, :-1]], dim=1)
+                
+                # Forward through predictor - use fixed label lengths
+                predictor_outputs = self.predictor(
+                    labels=predictor_labels,
+                    label_lengths=fixed_label_lengths,
+                )
+                
+                # Get predictor outputs
+                predictor_hidden_states = predictor_outputs["outputs"]
+                
+                # Check for NaN values in predictor outputs
+                if torch.isnan(predictor_hidden_states).any():
+                    print("WARNING: NaN values detected in predictor hidden states!")
+                    predictor_hidden_states = torch.nan_to_num(predictor_hidden_states, nan=0.0)
+                
+                # Joint network forward pass
+                logits = self.joint(
+                    encoder_outputs=encoder_hidden_states,
+                    predictor_outputs=predictor_hidden_states,
+                )
+                
+                # Check for NaN values in logits
+                if torch.isnan(logits).any():
+                    print("WARNING: NaN values detected in logits!")
+                    logits = torch.nan_to_num(logits, nan=0.0)
+                
+                # Debug: Check if logits require gradients
+                if not logits.requires_grad:
+                    print("WARNING: Logits do not require gradients after joint network forward pass!")
+                
+                return {
+                    "logits": logits,
+                    "encoder_outputs": encoder_hidden_states,
+                }
+            else:
+                # For inference
+                return {
+                    "encoder_outputs": encoder_hidden_states,
+                }
+                
+        except Exception as e:
+            print(f"ERROR in transducer forward pass: {e}")
+            print(f"Shapes - input_values: {input_values.shape}, ")
+            if labels is not None:
+                print(f"labels: {labels.shape}, ")
+            if label_lengths is not None:
+                print(f"label_lengths: {label_lengths.shape}")
             
-            # Forward through predictor
-            predictor_outputs = self.predictor(
-                labels=predictor_labels,
-                label_lengths=label_lengths,
-            )
+            # For training, raise the exception for debugging
+            if self.training:
+                raise
             
-            # Get predictor outputs
-            predictor_hidden_states = predictor_outputs["outputs"]
-            
-            # Check for NaN values in predictor outputs
-            if torch.isnan(predictor_hidden_states).any():
-                print("WARNING: NaN values detected in predictor hidden states!")
-                predictor_hidden_states = torch.nan_to_num(predictor_hidden_states, nan=0.0)
-            
-            # Joint network forward pass
-            logits = self.joint(
-                encoder_outputs=encoder_hidden_states,
-                predictor_outputs=predictor_hidden_states,
-            )
-            
-            # Check for NaN values in logits
-            if torch.isnan(logits).any():
-                print("WARNING: NaN values detected in logits!")
-                logits = torch.nan_to_num(logits, nan=0.0)
-            
-            # Debug: Check if logits require gradients
-            if not logits.requires_grad:
-                print("WARNING: Logits do not require gradients after joint network forward pass!")
-            
+            # For inference, return a minimal output to prevent crashes
             return {
-                "logits": logits,
-                "encoder_outputs": encoder_hidden_states,
-            }
-        else:
-            # For inference
-            return {
-                "encoder_outputs": encoder_hidden_states,
+                "encoder_outputs": torch.zeros(
+                    input_values.size(0), 
+                    input_values.size(1) // 320, 
+                    self.encoder.output_dim, 
+                    device=input_values.device
+                ),
             }
     
     def decode_greedy(
