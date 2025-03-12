@@ -9,8 +9,8 @@ data:
   sample_rate: 16000
   max_duration: 30.0
   min_duration: 0.5
-  batch_size: 2
-  num_workers: 4
+  batch_size: 16
+  num_workers: 8
 
 # Model configuration
 model:
@@ -55,7 +55,7 @@ training:
   save_interval: 5000
   early_stopping_patience: 5
   scheduler: "constant"  # Options: "linear", "cosine", "constant"
-  use_fp16: false
+  use_fp16: true
 
 # Tokenizer configuration
 tokenizer:
