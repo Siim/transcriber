@@ -1,0 +1,221 @@
+# XLSR-Transducer Training Stages Configuration
+
+# Stage 1: Non-Streaming XLSR-Transducer
+# Full attention training (baseline)
+stage1:
+  name: "non_streaming_baseline"
+  description: "Training with full attention (no masking)"
+  encoder:
+    attention_mask_type: "full"
+    chunk_size: 0
+    left_context: 0
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage1"
+
+# Stage 2: Chunked Masking
+# Training with different chunk sizes
+stage2a:
+  name: "chunked_masking_320ms"
+  description: "Training with 320ms chunks (16 frames)"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 16  # 16 frames = ~320ms at 20ms stride
+    left_context: 0
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage2a"
+    load_from: "checkpoints/stage1/best.pt"  # Load from Stage 1
+
+stage2b:
+  name: "chunked_masking_640ms"
+  description: "Training with 640ms chunks (32 frames)"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 32  # 32 frames = ~640ms at 20ms stride
+    left_context: 0
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage2b"
+    load_from: "checkpoints/stage1/best.pt"  # Load from Stage 1
+
+stage2c:
+  name: "chunked_masking_1280ms"
+  description: "Training with 1280ms chunks (64 frames)"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 64  # 64 frames = ~1280ms at 20ms stride
+    left_context: 0
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage2c"
+    load_from: "checkpoints/stage1/best.pt"  # Load from Stage 1
+
+stage2d:
+  name: "chunked_masking_2560ms"
+  description: "Training with 2560ms chunks (128 frames)"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 128  # 128 frames = ~2560ms at 20ms stride
+    left_context: 0
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage2d"
+    load_from: "checkpoints/stage1/best.pt"  # Load from Stage 1
+
+# Stage 3: Variable Left Context
+# Experimenting with different left context sizes
+stage3a:
+  name: "left_context_1x"
+  description: "Training with 1x left-context chunks"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 32  # 32 frames = ~640ms
+    left_context: 32  # 1x chunk size
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage3a"
+    load_from: "checkpoints/stage2b/best.pt"  # Load from Stage 2b
+
+stage3b:
+  name: "left_context_2x"
+  description: "Training with 2x left-context chunks"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 32  # 32 frames = ~640ms
+    left_context: 64  # 2x chunk size
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage3b"
+    load_from: "checkpoints/stage2b/best.pt"  # Load from Stage 2b
+
+stage3c:
+  name: "left_context_full"
+  description: "Training with full left context"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size: 32  # 32 frames = ~640ms
+    left_context: 9999  # Very large value for "full" context
+    right_context: 0
+    attention_sink_size: 0
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage3c"
+    load_from: "checkpoints/stage2b/best.pt"  # Load from Stage 2b
+
+# Stage 4: Multi-Chunk Training
+# Randomized chunk sizes during training
+stage4:
+  name: "multi_chunk_training"
+  description: "Training with randomized chunk sizes"
+  encoder:
+    attention_mask_type: "chunk"
+    chunk_size_min: 16  # 16 frames = ~320ms
+    chunk_size_max: 64  # 64 frames = ~1280ms
+    left_context: 64  # 2x medium chunk size
+    right_context: 0
+    attention_sink_size: 0
+    randomize_chunks: true
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage4"
+    load_from: "checkpoints/stage3b/best.pt"  # Load from Stage 3b
+
+# Stage 5: Attention Sink Implementation
+# Different attention sink configurations
+stage5a:
+  name: "attention_sink_4frames"
+  description: "Training with 4-frame attention sink"
+  encoder:
+    attention_mask_type: "attention_sink"
+    chunk_size: 32  # 32 frames = ~640ms
+    left_context: 32  # 1x chunk size
+    right_context: 0
+    attention_sink_size: 4  # 4 frames attention sink
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage5a"
+    load_from: "checkpoints/stage3a/best.pt"  # Load from Stage 3a
+
+stage5b:
+  name: "attention_sink_16frames"
+  description: "Training with 16-frame attention sink"
+  encoder:
+    attention_mask_type: "attention_sink"
+    chunk_size: 32  # 32 frames = ~640ms
+    left_context: 32  # 1x chunk size
+    right_context: 0
+    attention_sink_size: 16  # 16 frames attention sink
+  training:
+    epochs: 10
+    learning_rate: 0.000005
+    weight_decay: 0.000001
+    batch_size: 2
+    warmup_steps: 5000
+    grad_clip: 0.5
+    checkpoint_dir: "checkpoints/stage5b"
+    load_from: "checkpoints/stage3a/best.pt"  # Load from Stage 3a 

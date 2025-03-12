@@ -7,6 +7,7 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (
     Wav2Vec2EncoderLayer,
     Wav2Vec2Attention
 )
+from model.attention import AttentionSink
 
 
 class StreamingWav2Vec2Attention(nn.Module):
@@ -50,6 +51,14 @@ class StreamingWav2Vec2Attention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        
+        # Create attention sink if using that mask type
+        if attention_mask_type == "attention_sink":
+            self.attention_sink = AttentionSink(
+                sink_size=attention_sink_size,
+                left_context=left_context,
+                right_context=right_context,
+            )
     
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -89,6 +98,10 @@ class StreamingWav2Vec2Attention(nn.Module):
     
     def _create_attention_sink_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Create an attention mask with attention sinks for streaming inference."""
+        # Use the AttentionSink class if available
+        if hasattr(self, 'attention_sink'):
+            return self.attention_sink.create_attention_mask(seq_len, device)
+        
         # Initialize with all -inf (no attention)
         mask = torch.full(
             (seq_len, seq_len), float("-inf"), device=device
@@ -104,6 +117,12 @@ class StreamingWav2Vec2Attention(nn.Module):
             # Left context
             left_start = max(0, i - self.left_context)
             mask[i, left_start:i+1] = 0.0
+            
+            # Right context (if specified)
+            if self.right_context > 0:
+                right_end = min(seq_len, i + self.right_context + 1)
+                if right_end > i + 1:
+                    mask[i, i+1:right_end] = 0.0
         
         return mask
     
@@ -307,6 +326,10 @@ class XLSREncoder(nn.Module):
         left_context: int = 25,
         right_context: int = 0,
         attention_sink_size: int = 4,
+        # For multi-chunk training
+        chunk_size_min: int = 0,
+        chunk_size_max: int = 0,
+        randomize_chunks: bool = False,
     ):
         super().__init__()
         
@@ -346,6 +369,18 @@ class XLSREncoder(nn.Module):
             # Still enable dropout even when freezing
             self.model.train()
         
+        # Store attention masking parameters
+        self.attention_mask_type = attention_mask_type
+        self.chunk_size = chunk_size
+        self.left_context = left_context
+        self.right_context = right_context
+        self.attention_sink_size = attention_sink_size
+        
+        # Store multi-chunk training parameters
+        self.chunk_size_min = chunk_size_min
+        self.chunk_size_max = chunk_size_max
+        self.randomize_chunks = randomize_chunks
+        
         # Replace encoder layers with streaming encoder layers if using streaming
         if attention_mask_type != "full":
             streaming_layers = []
@@ -353,7 +388,7 @@ class XLSREncoder(nn.Module):
                 streaming_layer = StreamingWav2Vec2EncoderLayer(
                     config=config,
                     attention_mask_type=attention_mask_type,
-                    chunk_size=chunk_size,
+                    chunk_size=self._get_current_chunk_size(),
                     left_context=left_context,
                     right_context=right_context,
                     attention_sink_size=attention_sink_size,
@@ -394,7 +429,36 @@ class XLSREncoder(nn.Module):
         
         # Output projection
         self.output_dim = config.hidden_size
+    
+    def _get_current_chunk_size(self) -> int:
+        """
+        Get the current chunk size, which may be randomized for multi-chunk training.
         
+        Returns:
+            Current chunk size to use
+        """
+        if self.randomize_chunks and self.chunk_size_min > 0 and self.chunk_size_max > 0:
+            # For multi-chunk training, randomly select a chunk size
+            import random
+            return random.randint(self.chunk_size_min, self.chunk_size_max)
+        else:
+            # Use the fixed chunk size
+            return self.chunk_size
+    
+    def update_streaming_config(self) -> None:
+        """
+        Update streaming configuration in all layers.
+        Called at the start of each training batch to potentially change chunk sizes.
+        """
+        if self.attention_mask_type != "full":
+            # Get new chunk size if using randomized chunks
+            current_chunk_size = self._get_current_chunk_size()
+            
+            # Update each layer's attention mask
+            for layer in self.model.encoder.layers:
+                if hasattr(layer.attention, "chunk_size"):
+                    layer.attention.chunk_size = current_chunk_size
+    
     def _preprocess_input(self, input_values: torch.Tensor) -> torch.Tensor:
         """Preprocess input values for stability."""
         # Ensure input is in the range [-1, 1]
@@ -428,6 +492,10 @@ class XLSREncoder(nn.Module):
                 - last_hidden_state: Output tensor of shape (batch_size, seq_len, hidden_size)
                 - hidden_states: Optional tuple of hidden states
         """
+        # Update streaming configuration for this batch
+        if self.training and self.randomize_chunks:
+            self.update_streaming_config()
+            
         # Check for NaN values in input
         if torch.isnan(input_values).any():
             print("WARNING: NaN values detected in encoder input!")
@@ -463,7 +531,16 @@ class XLSREncoder(nn.Module):
             )
         
         hidden_states = self.model.feature_projection(extract_features)
-        hidden_states = self.model.encoder(hidden_states, attention_mask=attention_mask)[0]
+        
+        # Run the encoder part - handle return value carefully
+        encoder_outputs = self.model.encoder(hidden_states, attention_mask=attention_mask)
+        
+        # The encoder returns a tuple in newer transformers versions, check the type
+        if isinstance(encoder_outputs, tuple):
+            hidden_states = encoder_outputs[0]  # First element is usually the hidden states
+        else:
+            # Handle BaseModelOutput or other return types
+            hidden_states = encoder_outputs.last_hidden_state if hasattr(encoder_outputs, 'last_hidden_state') else encoder_outputs
         
         # Apply layer normalization for stability
         last_hidden_state = self.output_layer_norm(hidden_states)
