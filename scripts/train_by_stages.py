@@ -13,7 +13,7 @@ import shutil
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.append(src_dir)
 
-from trainer.trainer import Trainer
+from training.trainer import Trainer
 from model.transducer import XLSRTransducer
 from utils.file_utils import read_json, read_yaml, save_yaml
 from utils.metrics import compute_wer
@@ -92,23 +92,25 @@ def run_stage(stage_id, args, main_config, stages_config):
     
     # Check if we need to load a checkpoint from a previous stage
     resume_checkpoint = None
-    if "load_from" in stage_config:
-        prev_stage = stage_config["load_from"]
-        prev_stage_config = get_stage_config(stages_config, prev_stage)
-        prev_checkpoint_dir = prev_stage_config["checkpoint_dir"]
+    if "load_from" in stage_config.get("training", {}):
+        load_from_path = stage_config["training"]["load_from"]
         
-        # Find the best checkpoint from the previous stage
-        best_model_path = os.path.join(prev_checkpoint_dir, "best_model.pt")
-        if os.path.exists(best_model_path):
-            resume_checkpoint = best_model_path
-            logger.info(f"Loading best model from previous stage {prev_stage}: {resume_checkpoint}")
+        # Check if the checkpoint exists
+        if os.path.exists(load_from_path):
+            resume_checkpoint = load_from_path
+            logger.info(f"Loading from specified checkpoint: {resume_checkpoint}")
         else:
-            logger.warning(f"Could not find best model from previous stage {prev_stage}")
+            logger.warning(f"Specified checkpoint not found: {load_from_path}")
+            logger.warning("Training will start from scratch for this stage")
     
     # If a resume path was provided via CLI, it overrides everything
     if args.resume:
-        resume_checkpoint = args.resume
-        logger.info(f"Resuming from specified checkpoint: {resume_checkpoint}")
+        if os.path.exists(args.resume):
+            resume_checkpoint = args.resume
+            logger.info(f"Resuming from specified checkpoint: {resume_checkpoint}")
+        else:
+            logger.warning(f"Specified resume checkpoint not found: {args.resume}")
+            logger.warning("Training will start from scratch")
     
     # Initialize model and trainer
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu")
