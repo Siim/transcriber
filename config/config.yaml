@@ -3,7 +3,7 @@
 # Data configuration
 data:
   train_manifest: "data/train_list.txt"
-  valid_manifest: "data/valid_list.txt"
+  valid_manifest: "data/val_list.txt"
   test_manifest: "data/test_list.txt"
   audio_dir: ""
   sample_rate: 16000
