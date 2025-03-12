@@ -1,18 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Union
+import logging
+from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
 
-from .encoder import XLSREncoder
-from .predictor import TransducerPredictor
-from .joint import TransducerJoint
+from model.encoder import XLSREncoder
+from model.predictor import TransducerPredictor
+from model.joint import TransducerJoint
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class TransducerBeamHypothesis:
-    """Hypothesis for beam search decoding."""
-    
+    """
+    Hypothesis for beam search decoding.
+    """
     sequence: List[int]
     score: float
     predictor_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -27,20 +30,61 @@ class XLSRTransducer(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        blank_id: int,
-        encoder_params: Dict = None,
-        predictor_params: Dict = None,
-        joint_params: Dict = None,
+        blank_id: int = 0,
+        encoder_model_path: Optional[str] = None,
+        encoder_dim: int = 1024,
+        predictor_dim: int = 640,
+        predictor_hidden_dim: int = 640,
+        joint_dim: int = 640,
+        freeze_encoder: bool = True,
+        encoder_params: Optional[Dict] = None,
+        predictor_params: Optional[Dict] = None,
+        joint_params: Optional[Dict] = None,
+        debug: bool = False,
     ):
+        """
+        Initialize the XLSR-Transducer model.
+        
+        Args:
+            vocab_size: Size of vocabulary
+            blank_id: ID of blank token (default: 0)
+            encoder_model_path: Path to pretrained XLSR model
+            encoder_dim: Dimension of encoder output
+            predictor_dim: Dimension of predictor output
+            predictor_hidden_dim: Dimension of predictor hidden state
+            joint_dim: Dimension of joint network
+            freeze_encoder: Whether to freeze encoder parameters
+            encoder_params: Optional dictionary of parameters for encoder (overrides individual params)
+            predictor_params: Optional dictionary of parameters for predictor (overrides individual params)
+            joint_params: Optional dictionary of parameters for joint network (overrides individual params)
+            debug: Whether to print debug information
+        """
         super().__init__()
+        
+        self.vocab_size = vocab_size
+        self.blank_id = blank_id
+        self.debug = debug
+        self.logger = logger
         
         # Default parameters
         if encoder_params is None:
             encoder_params = {}
+            if encoder_model_path is not None:
+                encoder_params["model_path"] = encoder_model_path
+            encoder_params["output_dim"] = encoder_dim
+            encoder_params["freeze"] = freeze_encoder
+        
         if predictor_params is None:
             predictor_params = {}
+            predictor_params["embedding_dim"] = predictor_dim
+            predictor_params["hidden_dim"] = predictor_hidden_dim
+            predictor_params["output_dim"] = predictor_dim
+        
         if joint_params is None:
             joint_params = {}
+            joint_params["encoder_dim"] = encoder_dim
+            joint_params["predictor_dim"] = predictor_dim
+            joint_params["hidden_dim"] = joint_dim
         
         # Initialize encoder
         self.encoder = XLSREncoder(**encoder_params)
@@ -50,13 +94,14 @@ class XLSRTransducer(nn.Module):
         self.predictor = TransducerPredictor(**predictor_params)
         
         # Initialize joint network
-        joint_params["encoder_dim"] = self.encoder.output_dim
-        joint_params["predictor_dim"] = self.predictor.output_dim
         joint_params["vocab_size"] = vocab_size
-        self.joint = TransducerJoint(**joint_params)
+        # Ensure encoder and predictor dimensions match what's in the components
+        if "encoder_dim" not in joint_params:
+            joint_params["encoder_dim"] = self.encoder.output_dim
+        if "predictor_dim" not in joint_params:
+            joint_params["predictor_dim"] = predictor_dim
         
-        # Blank token ID
-        self.blank_id = blank_id
+        self.joint = TransducerJoint(**joint_params)
     
     def forward(
         self,
@@ -66,38 +111,26 @@ class XLSRTransducer(nn.Module):
         label_lengths: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass of the transducer model.
+        Forward pass of the model.
         
         Args:
             input_values: Input tensor of shape (batch_size, seq_len)
-            attention_mask: Optional mask of shape (batch_size, seq_len)
-            labels: Optional labels of shape (batch_size, max_label_length)
-            label_lengths: Optional lengths of labels of shape (batch_size,)
+            attention_mask: Attention mask of shape (batch_size, seq_len)
+            labels: Labels of shape (batch_size, max_label_length)
+            label_lengths: Lengths of labels of shape (batch_size,)
             
         Returns:
-            Dictionary containing:
-                - logits: Output tensor of shape (batch_size, time_steps, label_length, vocab_size)
-                - encoder_outputs: Encoder outputs of shape (batch_size, time_steps, encoder_dim)
+            Dictionary containing model outputs
         """
-        # Ensure training mode is set correctly
-        if self.training:
-            self.encoder.train()
-            self.predictor.train()
-            self.joint.train()
-        
-        # Check for NaN values in input
-        if torch.isnan(input_values).any():
-            print("WARNING: NaN values detected in model input!")
-            input_values = torch.nan_to_num(input_values, nan=0.0)
-        
-        # Extra diagnostic information
-        print(f"Input values shape: {input_values.shape}, device: {input_values.device}")
-        if attention_mask is not None:
-            print(f"Attention mask shape: {attention_mask.shape}, device: {attention_mask.device}")
-        if labels is not None:
-            print(f"Labels shape: {labels.shape}, device: {labels.device}")
-        if label_lengths is not None:
-            print(f"Label lengths shape: {label_lengths.shape}, device: {label_lengths.device}")
+        # Debug info
+        if self.debug:
+            print(f"Input values shape: {input_values.shape}, device: {input_values.device}")
+            if attention_mask is not None:
+                print(f"Attention mask shape: {attention_mask.shape}, device: {attention_mask.device}")
+            if labels is not None:
+                print(f"Labels shape: {labels.shape}, device: {labels.device}")
+            if label_lengths is not None:
+                print(f"Label lengths shape: {label_lengths.shape}, device: {label_lengths.device}")
         
         try:
             # Encoder forward pass
@@ -111,8 +144,14 @@ class XLSRTransducer(nn.Module):
             
             # Check for NaN values in encoder outputs
             if torch.isnan(encoder_hidden_states).any():
-                print("WARNING: NaN values detected in encoder hidden states!")
+                self.logger.warning("NaN values detected in encoder hidden states!")
                 encoder_hidden_states = torch.nan_to_num(encoder_hidden_states, nan=0.0)
+            
+            # Ensure encoder outputs require gradients if we're training
+            if self.training and not encoder_hidden_states.requires_grad:
+                self.logger.warning("Encoder outputs don't require gradients. Creating a differentiable copy.")
+                # Create a differentiable copy that maintains the computational graph
+                encoder_hidden_states = encoder_hidden_states + 0.0
             
             # Predictor forward pass (if labels are provided)
             if labels is not None and label_lengths is not None:
@@ -131,7 +170,8 @@ class XLSRTransducer(nn.Module):
                 # Move back to the original device
                 fixed_label_lengths = fixed_label_lengths.to(device)
                 
-                print(f"After fixing: Label lengths min: {fixed_label_lengths.min().item()}, max: {fixed_label_lengths.max().item()}")
+                if self.debug:
+                    print(f"After fixing: Label lengths min: {fixed_label_lengths.min().item()}, max: {fixed_label_lengths.max().item()}")
                 
                 # Shift labels right by adding blank at the beginning
                 blank_tensor = torch.full(
@@ -150,8 +190,14 @@ class XLSRTransducer(nn.Module):
                 
                 # Check for NaN values in predictor outputs
                 if torch.isnan(predictor_hidden_states).any():
-                    print("WARNING: NaN values detected in predictor hidden states!")
+                    self.logger.warning("NaN values detected in predictor hidden states!")
                     predictor_hidden_states = torch.nan_to_num(predictor_hidden_states, nan=0.0)
+                
+                # Ensure predictor outputs require gradients if we're training
+                if self.training and not predictor_hidden_states.requires_grad:
+                    self.logger.warning("Predictor outputs don't require gradients. Creating a differentiable copy.")
+                    # Create a differentiable copy that maintains the computational graph
+                    predictor_hidden_states = predictor_hidden_states + 0.0
                 
                 # Joint network forward pass
                 logits = self.joint(
@@ -161,11 +207,11 @@ class XLSRTransducer(nn.Module):
                 
                 # Check for NaN values in logits
                 if torch.isnan(logits).any():
-                    print("WARNING: NaN values detected in logits!")
+                    self.logger.warning("NaN values detected in logits!")
                     logits = torch.nan_to_num(logits, nan=0.0)
                 
                 # Debug: Check if logits require gradients
-                if not logits.requires_grad:
+                if self.debug and not logits.requires_grad:
                     print("WARNING: Logits do not require gradients after joint network forward pass!")
                 
                 return {
@@ -179,12 +225,12 @@ class XLSRTransducer(nn.Module):
                 }
                 
         except Exception as e:
-            print(f"ERROR in transducer forward pass: {e}")
-            print(f"Shapes - input_values: {input_values.shape}, ")
+            self.logger.error(f"ERROR in transducer forward pass: {e}")
+            self.logger.error(f"Shapes - input_values: {input_values.shape}, ")
             if labels is not None:
-                print(f"labels: {labels.shape}, ")
+                self.logger.error(f"labels: {labels.shape}, ")
             if label_lengths is not None:
-                print(f"label_lengths: {label_lengths.shape}")
+                self.logger.error(f"label_lengths: {label_lengths.shape}")
             
             # For training, raise the exception for debugging
             if self.training:

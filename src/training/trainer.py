@@ -9,9 +9,10 @@ import time
 from tqdm import tqdm
 import numpy as np
 from dataclasses import dataclass, field
+import contextlib
 
 from model.transducer import XLSRTransducer
-from training.loss import TransducerLossWrapper
+from training.loss import TransducerLoss
 from data.dataset import EstonianASRDataset, collate_fn, create_length_sorted_dataloader
 from data.processor import XLSRTransducerProcessor
 
@@ -124,6 +125,13 @@ class XLSRTransducerTrainer:
         import torch
         import torch.optim as optim
         
+        # Set up logging FIRST, before using it
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            level=logging.INFO,
+        )
+        self.logger = logging.getLogger(__name__)
+        
         self.model = model
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
@@ -154,12 +162,14 @@ class XLSRTransducerTrainer:
                     # Set config to avoid recompilations
                     torch._dynamo.config.suppress_errors = True
                     torch._dynamo.config.cache_size_limit = 512
+                else:
+                    self.logger.info(f"Device {self.device.type} not supported for torch.compile, using standard execution")
         except (ImportError, AttributeError):
             # torch.compile not available, continue without it
             self.logger.info("torch.compile not available, using standard model execution")
         
         # Set up loss function
-        self.loss_fn = TransducerLossWrapper(blank_id=model.blank_id)
+        self.loss_fn = TransducerLoss(blank_id=model.blank_id)
         
         # Set up optimizer
         if optimizer is None:
@@ -196,15 +206,19 @@ class XLSRTransducerTrainer:
         else:
             self.scheduler = scheduler
         
-        # Set up scaler for mixed precision training
-        self.scaler = torch.amp.GradScaler('cuda') if self.args.use_fp16 else None
-        
-        # Set up logging
-        logging.basicConfig(
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            level=logging.INFO,
-        )
-        self.logger = logging.getLogger(__name__)
+        # Set up scaler for mixed precision training - handle both CUDA and MPS
+        if self.args.use_fp16:
+            if self.device.type == "cuda":
+                self.scaler = torch.amp.GradScaler()
+            elif self.device.type == "mps":
+                # MPS doesn't support GradScaler yet, but can use autocast
+                self.scaler = None
+                self.logger.info("MPS device detected: using autocast without GradScaler")
+            else:
+                self.scaler = None
+                self.logger.info("Mixed precision requested but not supported on this device")
+        else:
+            self.scaler = None
         
         # Create output directories
         os.makedirs(self.args.output_dir, exist_ok=True)
@@ -268,71 +282,41 @@ class XLSRTransducerTrainer:
         Returns:
             Dictionary of training metrics
         """
+        # Set the model to training mode
         self.model.train()
         
-        # Debugging: Check if model parameters require gradients
-        param_requires_grad = {}
-        for name, param in self.model.named_parameters():
-            param_requires_grad[name] = param.requires_grad
+        # Get gradient accumulation steps
+        gradient_accumulation_steps = self.args.gradient_accumulation_steps
         
-        # Count trainable parameters
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        non_trainable_params = sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Non-trainable parameters: {non_trainable_params:,}")
-        
-        # Print a few key parameters to check
-        if 'encoder.model.feature_extractor.conv_layers.0.conv.weight' in param_requires_grad:
-            print(f"Encoder feature extractor requires_grad: {param_requires_grad['encoder.model.feature_extractor.conv_layers.0.conv.weight']}")
-        if 'predictor.embedding.weight' in param_requires_grad:
-            print(f"Predictor embedding requires_grad: {param_requires_grad['predictor.embedding.weight']}")
-        if 'joint.output_proj.weight' in param_requires_grad:
-            print(f"Joint output_proj requires_grad: {param_requires_grad['joint.output_proj.weight']}")
-        
-        total_loss = 0.0
+        # Create progress bar
         num_batches = len(self.train_dataloader)
+        progress_bar = tqdm(total=num_batches, desc=f"Epoch {self.epoch + 1}")
+        
+        # Initialize metrics
+        total_loss = 0.0
+        
+        # Initialize performance tracking
         start_time = time.time()
-        
-        # Get gradient accumulation steps from config
-        gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
-        if gradient_accumulation_steps > 1:
-            self.logger.info(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
-            
-            # Get batch size - handle case where we're using a batch_sampler
-            if hasattr(self.train_dataloader, 'batch_size') and self.train_dataloader.batch_size is not None:
-                batch_size = self.train_dataloader.batch_size
-            elif hasattr(self.train_dataloader, 'batch_sampler') and hasattr(self.train_dataloader.batch_sampler, 'batch_size'):
-                batch_size = self.train_dataloader.batch_sampler.batch_size
-            else:
-                # Default to a reasonable value if we can't determine it
-                batch_size = 2
-                self.logger.warning(f"Could not determine batch size, using default: {batch_size}")
-                
-            effective_batch_size = batch_size * gradient_accumulation_steps
-            self.logger.info(f"Effective batch size: {effective_batch_size}")
-        
-        # Progress bar
-        progress_bar = tqdm(
-            total=num_batches,
-            desc=f"Epoch {self.epoch + 1}",
-            leave=False,
-        )
-        
-        # Performance tracking
         batch_times = []
-        memory_usage = []
         data_loading_times = []
         forward_times = []
         backward_times = []
         
-        # Log memory usage at the start
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+        # Track GPU memory usage if available
+        if torch.cuda.is_available() and self.device.type == "cuda":
             start_memory = torch.cuda.memory_allocated() / (1024 ** 3)
-            self.logger.info(f"Initial GPU memory usage: {start_memory:.2f}GB")
-        
-        # Zero gradients at the beginning of the epoch
-        self.optimizer.zero_grad()
+            memory_usage = []
+        else:
+            memory_usage = None
+            start_memory = 0
+
+        # Determine which device type to use for autocast (if fp16 is enabled)
+        amp_device_type = "cpu"
+        if self.args.use_fp16:
+            if self.device.type == "cuda":
+                amp_device_type = "cuda"
+            elif self.device.type == "mps":
+                amp_device_type = "mps"
         
         # Use Async data loading to overlap data loading with computation
         data_load_start = time.time()
@@ -349,86 +333,19 @@ class XLSRTransducerTrainer:
             # Move batch to device with non_blocking=True for parallel transfer
             batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
             
-            # Ensure data is on device before computation
-            torch.cuda.synchronize()
+            # Ensure data is on device before computation - safely handle different device types
+            if torch.cuda.is_available() and self.device.type == "cuda":
+                torch.cuda.synchronize()
+            elif hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize') and self.device.type == "mps":
+                torch.mps.synchronize()
             
-            # Forward pass with mixed precision
+            # Forward pass
             forward_start = time.time()
-            if self.args.use_fp16:
-                with torch.amp.autocast('cuda'):
-                    outputs = self.model(
-                        input_values=batch["input_values"],
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                        label_lengths=batch["label_lengths"],
-                    )
-                    
-                    loss = self.loss_fn(
-                        outputs=outputs,
-                        labels=batch["labels"],
-                        label_lengths=batch["label_lengths"],
-                        attention_mask=batch["attention_mask"],
-                    )
-                    
-                    # Scale loss for gradient accumulation
-                    if gradient_accumulation_steps > 1:
-                        loss = loss / gradient_accumulation_steps
-                    
-                    # Check if loss requires gradient
-                    if batch_idx == 0:
-                        print(f"Loss requires_grad: {loss.requires_grad}")
-                        if 'logits' in outputs:
-                            print(f"Logits requires_grad: {outputs['logits'].requires_grad}")
-                
-                # Check for NaN loss
-                if torch.isnan(loss).any():
-                    self.logger.warning(f"NaN loss detected at step {self.global_step}. Skipping batch.")
-                    # Skip this batch
-                    continue
-                
-                # Record forward pass time
-                forward_time = time.time() - forward_start
-                forward_times.append(forward_time)
-                
-                # Backward pass with gradient scaling
-                backward_start = time.time()
-                self.scaler.scale(loss).backward()
-                
-                # Record backward pass time
-                backward_time = time.time() - backward_start
-                backward_times.append(backward_time)
-                
-                # Only update weights after accumulating gradients
-                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
-                    # Check for NaN gradients
-                    has_nan_grad = False
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
-                            has_nan_grad = True
-                            break
-                    
-                    if has_nan_grad:
-                        self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
-                        # Skip parameter update for this batch
-                        self.optimizer.zero_grad()
-                        continue
-                    
-                    # Gradient clipping
-                    if self.args.grad_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.args.grad_clip
-                        )
-                    
-                    # Update weights
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    
-                    # Zero gradients
-                    self.optimizer.zero_grad()
-            else:
-                # Forward pass (same pattern as above but without amp.autocast)
+            
+            # Context manager for mixed precision (if enabled)
+            cm = torch.amp.autocast(device_type=amp_device_type) if self.args.use_fp16 else contextlib.nullcontext()
+            
+            with cm:
                 outputs = self.model(
                     input_values=batch["input_values"],
                     attention_mask=batch["attention_mask"],
@@ -447,51 +364,70 @@ class XLSRTransducerTrainer:
                 if gradient_accumulation_steps > 1:
                     loss = loss / gradient_accumulation_steps
                 
-                # Check for NaN loss
-                if torch.isnan(loss).any():
-                    self.logger.warning(f"NaN loss detected at step {self.global_step}. Skipping batch.")
-                    # Skip this batch
+                # Debug logging for first batch
+                if batch_idx == 0:
+                    self.logger.debug(f"Loss requires_grad: {loss.requires_grad}")
+                    if 'logits' in outputs:
+                        self.logger.debug(f"Logits requires_grad: {outputs['logits'].requires_grad}")
+            
+            # Check for NaN loss
+            if torch.isnan(loss).any():
+                self.logger.warning(f"NaN loss detected at step {self.global_step}. Skipping batch.")
+                # Skip this batch
+                continue
+            
+            # Record forward pass time
+            forward_time = time.time() - forward_start
+            forward_times.append(forward_time)
+            
+            # Backward pass with gradient scaling if available
+            backward_start = time.time()
+            
+            # Use scaler only on CUDA devices
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                # Regular backward on CPU or MPS
+                loss.backward()
+            
+            # Record backward pass time
+            backward_time = time.time() - backward_start
+            backward_times.append(backward_time)
+            
+            # Only update weights after accumulating gradients
+            if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
+                # Check for NaN gradients
+                has_nan_grad = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
+                    # Skip parameter update for this batch
+                    self.optimizer.zero_grad()
                     continue
                 
-                # Record forward pass time
-                forward_time = time.time() - forward_start
-                forward_times.append(forward_time)
-                
-                # Backward pass
-                backward_start = time.time()
-                loss.backward()
-                
-                # Record backward pass time
-                backward_time = time.time() - backward_start
-                backward_times.append(backward_time)
-                
-                # Only update weights after accumulating gradients
-                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
-                    # Check for NaN gradients
-                    has_nan_grad = False
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
-                            has_nan_grad = True
-                            break
+                # Gradient clipping - handle with or without scaler
+                if self.args.grad_clip > 0:
+                    if self.scaler is not None:
+                        self.scaler.unscale_(self.optimizer)
                     
-                    if has_nan_grad:
-                        self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
-                        # Skip parameter update for this batch
-                        self.optimizer.zero_grad()
-                        continue
-                    
-                    # Gradient clipping
-                    if self.args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), self.args.grad_clip
-                        )
-                    
-                    # Update weights
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.args.grad_clip
+                    )
+                
+                # Update weights - handle with or without scaler
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
                     self.optimizer.step()
-                    
-                    # Zero gradients
-                    self.optimizer.zero_grad()
+                
+                # Zero gradients
+                self.optimizer.zero_grad()
             
             # Check for NaN parameters after update
             has_nan_param = False
@@ -536,16 +472,18 @@ class XLSRTransducerTrainer:
             # Performance tracking
             batch_compute_time = time.time() - batch_start_time
             batch_times.append(batch_compute_time)
-            if torch.cuda.is_available():
+            
+            if torch.cuda.is_available() and self.device.type == "cuda":
                 memory_usage.append(torch.cuda.memory_allocated() / (1024 ** 3) - start_memory)
                 
             # Start timing data loading for the next batch
             data_load_start = time.time()
             
-            # Use torch.cuda.current_stream().synchronize() to make sure all GPU ops are done
-            # This avoids false timing measurements due to asynchronous execution
-            if torch.cuda.is_available():
+            # Use appropriate stream synchronization based on device type
+            if torch.cuda.is_available() and self.device.type == "cuda":
                 torch.cuda.current_stream().synchronize()
+            elif hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize') and self.device.type == "mps":
+                torch.mps.synchronize()
         
         # Close progress bar
         progress_bar.close()
@@ -565,80 +503,85 @@ class XLSRTransducerTrainer:
         self.logger.info(f"Average forward pass time: {np.mean(forward_times):.4f}s")
         self.logger.info(f"Average backward pass time: {np.mean(backward_times):.4f}s")
         self.logger.info(f"Maximum batch time: {max(batch_times):.4f}s")
-        self.logger.info(f"Minimum batch time: {min(batch_times):.4f}s")
         
-        if torch.cuda.is_available():
-            peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            self.logger.info(f"Peak GPU memory usage: {peak_memory:.2f}GB")
-            self.logger.info(f"Memory usage: {np.mean(memory_usage):.2f}GB")
+        # Memory usage stats if available
+        if memory_usage:
+            self.logger.info(f"Peak GPU memory usage: {max(memory_usage):.2f}GB")
         
-        return {
-            "train_loss": avg_loss,
-            "epoch": self.epoch + 1,
-            "global_step": self.global_step,
-        }
+        return {"loss": avg_loss}
     
     def evaluate(self) -> Dict[str, float]:
         """
-        Evaluate the model.
+        Evaluate the model on the evaluation dataset.
         
         Returns:
             Dictionary of evaluation metrics
         """
+        # Set the model to evaluation mode
+        self.model.eval()
+        
+        # Skip if no eval dataloader
         if self.eval_dataloader is None:
             return {}
         
-        self.model.eval()
-        
+        # Initialize metrics
         total_loss = 0.0
-        num_batches = len(self.eval_dataloader)
-        all_preds = []
-        all_labels = []
         
-        # Progress bar
-        progress_bar = tqdm(
-            total=num_batches,
-            desc="Evaluating",
-            leave=False,
-        )
+        # Create progress bar
+        num_batches = len(self.eval_dataloader)
+        progress_bar = tqdm(total=num_batches, desc="Evaluating")
+        
+        # Determine which device type to use for autocast (if fp16 is enabled)
+        amp_device_type = "cpu"
+        if self.args.use_fp16:
+            if self.device.type == "cuda":
+                amp_device_type = "cuda"
+            elif self.device.type == "mps":
+                amp_device_type = "mps"
         
         # Evaluation loop
         with torch.no_grad():
             for batch in self.eval_dataloader:
-                # Move batch to device
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                # Move batch to device with non_blocking=True
+                batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                 
-                # Forward pass
-                outputs = self.model(
-                    input_values=batch["input_values"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                    label_lengths=batch["label_lengths"],
-                )
+                # Ensure data is on device before computation
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                elif hasattr(torch, 'mps') and hasattr(torch.mps, 'synchronize') and self.device.type == "mps":
+                    torch.mps.synchronize()
                 
-                # Compute loss
-                loss = self.loss_fn(
-                    outputs=outputs,
-                    labels=batch["labels"],
-                    label_lengths=batch["label_lengths"],
-                    attention_mask=batch["attention_mask"],
-                )
+                # Context manager for mixed precision
+                cm = torch.amp.autocast(device_type=amp_device_type) if self.args.use_fp16 else contextlib.nullcontext()
+                
+                with cm:
+                    # Forward pass
+                    outputs = self.model(
+                        input_values=batch["input_values"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                        label_lengths=batch["label_lengths"],
+                    )
+                    
+                    # Compute loss
+                    loss = self.loss_fn(
+                        outputs=outputs,
+                        labels=batch["labels"],
+                        label_lengths=batch["label_lengths"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                
+                # Check for NaN loss
+                if torch.isnan(loss).any():
+                    self.logger.warning(f"NaN loss detected during evaluation. Skipping batch.")
+                    continue
                 
                 # Update metrics
                 total_loss += loss.item()
                 
-                # Decode predictions
-                encoder_outputs = outputs["encoder_outputs"]
-                predictions = self.model.decode_greedy(encoder_outputs)
-                
-                # Collect predictions and labels for metrics
-                all_preds.extend(predictions)
-                
-                for i, length in enumerate(batch["label_lengths"]):
-                    all_labels.append(batch["labels"][i, :length].cpu().tolist())
-                
                 # Update progress bar
                 progress_bar.update(1)
+                progress_bar.set_postfix({"loss": loss.item()})
         
         # Close progress bar
         progress_bar.close()
@@ -646,20 +589,10 @@ class XLSRTransducerTrainer:
         # Compute metrics
         avg_loss = total_loss / num_batches
         
-        self.logger.info(f"Evaluation: loss = {avg_loss:.4f}")
+        # Log metrics
+        self.logger.info(f"Evaluation loss: {avg_loss:.4f}")
         
-        # Compute additional metrics if provided
-        metrics = {"eval_loss": avg_loss}
-        
-        if self.compute_metrics is not None:
-            additional_metrics = self.compute_metrics(all_preds, all_labels)
-            metrics.update(additional_metrics)
-            
-            # Log additional metrics
-            for name, value in additional_metrics.items():
-                self.logger.info(f"Evaluation: {name} = {value:.4f}")
-        
-        return metrics
+        return {"loss": avg_loss}
     
     def _save_checkpoint(self, name: str) -> None:
         """

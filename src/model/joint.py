@@ -1,39 +1,53 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
+import logging
 
+logger = logging.getLogger(__name__)
 
 class TransducerJoint(nn.Module):
     """
-    Joint network for the transducer model.
-    Combines encoder and predictor outputs to predict the next token.
+    Joint network for RNN-T.
     """
-    
+
     def __init__(
         self,
         encoder_dim: int,
         predictor_dim: int,
         hidden_dim: int,
         vocab_size: int,
+        dropout: float = 0.0,
+        joint_dropout: float = 0.0,
+        use_bias: bool = True,
         activation: str = "relu",
-        dropout: float = 0.1,
+        norm_type: Optional[str] = None,
     ):
+        """
+        Initialize the joint network.
+        
+        Args:
+            encoder_dim: Dimension of encoder output
+            predictor_dim: Dimension of predictor output
+            hidden_dim: Dimension of hidden layer
+            vocab_size: Size of vocabulary
+            dropout: Dropout rate for projection layers
+            joint_dropout: Dropout rate for joint output
+            use_bias: Whether to use bias in projection layers
+            activation: Activation function to use
+            norm_type: Type of normalization to use. Either "batch" or "layer" or None.
+        """
         super().__init__()
         
+        # Dimensions
         self.encoder_dim = encoder_dim
         self.predictor_dim = predictor_dim
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         
-        # Projection layers with smaller initialization
-        self.encoder_proj = nn.Linear(encoder_dim, hidden_dim)
-        self.predictor_proj = nn.Linear(predictor_dim, hidden_dim)
-        
-        # Layer normalization for stability
-        self.encoder_norm = nn.LayerNorm(hidden_dim)
-        self.predictor_norm = nn.LayerNorm(hidden_dim)
-        self.joint_norm = nn.LayerNorm(hidden_dim)
+        # Dropout rates
+        self.dropout = dropout
+        self.joint_dropout = joint_dropout
         
         # Activation function
         if activation == "relu":
@@ -43,144 +57,161 @@ class TransducerJoint(nn.Module):
         elif activation == "gelu":
             self.activation = nn.GELU()
         else:
-            raise ValueError(f"Unsupported activation: {activation}")
+            raise ValueError(f"Unsupported activation function: {activation}")
+
+        # Projection layers
+        self.encoder_proj = nn.Linear(encoder_dim, hidden_dim, bias=use_bias)
+        self.predictor_proj = nn.Linear(predictor_dim, hidden_dim, bias=use_bias)
+        self.dropout_layer = nn.Dropout(dropout)
+        self.joint_dropout_layer = nn.Dropout(joint_dropout)
         
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
+        # Normalization
+        self.norm_type = norm_type
+        if norm_type == "batch":
+            self.norm = nn.BatchNorm1d(hidden_dim)
+            self.norm_2d = True
+        elif norm_type == "layer":
+            self.norm = nn.LayerNorm(hidden_dim)
+            self.norm_2d = False
+        else:
+            self.norm = None
+            self.norm_2d = False
         
         # Output projection
-        self.output_proj = nn.Linear(hidden_dim, vocab_size)
+        self.output_proj = nn.Linear(hidden_dim, vocab_size, bias=use_bias)
         
-        # Initialize weights with smaller values to prevent exploding gradients
-        nn.init.xavier_uniform_(self.encoder_proj.weight, gain=0.05)
-        nn.init.xavier_uniform_(self.predictor_proj.weight, gain=0.05)
-        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.05)
+        # Weight initialization - Xavier uniform to prevent exploding gradients
+        nn.init.xavier_uniform_(self.encoder_proj.weight)
+        nn.init.xavier_uniform_(self.predictor_proj.weight)
+        nn.init.xavier_uniform_(self.output_proj.weight)
         
-        # Initialize biases to small values
-        nn.init.constant_(self.encoder_proj.bias, 0.0)
-        nn.init.constant_(self.predictor_proj.bias, 0.0)
-        nn.init.constant_(self.output_proj.bias, 0.0)
-    
+        # Bias initialization
+        if use_bias:
+            nn.init.zeros_(self.encoder_proj.bias)
+            nn.init.zeros_(self.predictor_proj.bias)
+            nn.init.zeros_(self.output_proj.bias)
+
     def forward(
         self,
         encoder_outputs: torch.Tensor,
         predictor_outputs: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward pass of the joint network.
+        Forward pass for joint network.
         
         Args:
-            encoder_outputs: Encoder outputs of shape (batch_size, time_steps, encoder_dim)
-            predictor_outputs: Predictor outputs of shape (batch_size, label_length, predictor_dim)
+            encoder_outputs: Output from encoder (B, T, D_enc)
+            predictor_outputs: Output from predictor (B, U, D_pred)
             
         Returns:
-            Joint outputs of shape (batch_size, time_steps, label_length, vocab_size)
+            Joint output (B, T, U, V)
         """
         # Check for NaN values in inputs
-        if torch.isnan(encoder_outputs).any() or torch.isnan(predictor_outputs).any():
-            print("WARNING: NaN values detected in joint network inputs!")
+        if torch.isnan(encoder_outputs).any():
+            logger.warning("NaN values detected in encoder outputs")
+        if torch.isnan(predictor_outputs).any():
+            logger.warning("NaN values detected in predictor outputs")
         
-        # Check if inputs require gradients
+        # Check if inputs require gradients - log warning but don't modify tensors
         if not encoder_outputs.requires_grad:
-            print("WARNING: Encoder outputs do not require gradients in joint network!")
-            # Ensure encoder outputs require gradients
-            encoder_outputs = encoder_outputs.detach().requires_grad_(True)
-            
+            logger.warning("Encoder outputs don't require gradients - this may cause issues in training")
         if not predictor_outputs.requires_grad:
-            print("WARNING: Predictor outputs do not require gradients in joint network!")
-            # Ensure predictor outputs require gradients
-            predictor_outputs = predictor_outputs.detach().requires_grad_(True)
-            
-        # Project encoder outputs
-        encoder_proj = self.encoder_proj(encoder_outputs)  # (batch_size, time_steps, hidden_dim)
-        encoder_proj = self.encoder_norm(encoder_proj)
+            logger.warning("Predictor outputs don't require gradients - this may cause issues in training")
         
-        # Project predictor outputs
-        predictor_proj = self.predictor_proj(predictor_outputs)  # (batch_size, label_length, hidden_dim)
-        predictor_proj = self.predictor_norm(predictor_proj)
+        # Get dimensions
+        batch_size, max_time, _ = encoder_outputs.size()
+        _, max_label, _ = predictor_outputs.size()
         
-        # Add dimensions for broadcasting
-        encoder_proj = encoder_proj.unsqueeze(2)  # (batch_size, time_steps, 1, hidden_dim)
-        predictor_proj = predictor_proj.unsqueeze(1)  # (batch_size, 1, label_length, hidden_dim)
+        # Project encoder outputs (B, T, D_enc) -> (B, T, D_h)
+        encoder_proj = self.encoder_proj(encoder_outputs)
+        encoder_proj = self.dropout_layer(encoder_proj)
         
-        # Combine outputs - use addition instead of scaling
-        joint = encoder_proj + predictor_proj  # (batch_size, time_steps, label_length, hidden_dim)
+        # Project predictor outputs (B, U, D_pred) -> (B, U, D_h)
+        predictor_proj = self.predictor_proj(predictor_outputs)
+        predictor_proj = self.dropout_layer(predictor_proj)
         
-        # Apply layer normalization
-        joint = self.joint_norm(joint)
+        # Expand tensors for broadcasting
+        # (B, T, D_h) -> (B, T, 1, D_h)
+        encoder_proj = encoder_proj.unsqueeze(2)
+        # (B, U, D_h) -> (B, 1, U, D_h)
+        predictor_proj = predictor_proj.unsqueeze(1)
         
-        # Apply activation and dropout
+        # Broadcast and sum
+        # (B, T, 1, D_h) + (B, 1, U, D_h) -> (B, T, U, D_h)
+        joint = encoder_proj + predictor_proj
+        
+        # Apply activation
         joint = self.activation(joint)
-        joint = self.dropout(joint)
         
-        # Project to vocabulary
-        outputs = self.output_proj(joint)  # (batch_size, time_steps, label_length, vocab_size)
+        # Apply normalization if needed
+        if self.norm is not None:
+            if self.norm_2d:  # BatchNorm1d expects [N, C, *]
+                joint_for_norm = joint.view(-1, self.hidden_dim).contiguous()
+                joint = self.norm(joint_for_norm).view(batch_size, max_time, max_label, self.hidden_dim)
+            else:  # LayerNorm
+                joint = self.norm(joint)
         
-        # Check for NaN values in outputs
-        if torch.isnan(outputs).any():
-            print("WARNING: NaN values detected in joint network outputs!")
-            outputs = torch.nan_to_num(outputs, nan=0.0)
+        # Apply dropout and project to vocabulary dimension
+        joint = self.joint_dropout_layer(joint)
         
-        # Check if outputs require gradients
-        if not outputs.requires_grad:
-            print("WARNING: Joint network outputs do not require gradients!")
+        # (B, T, U, D_h) -> (B, T, U, V)
+        logits = self.output_proj(joint)
         
-        return outputs
-    
+        return logits
+
     def forward_step(
         self,
         encoder_output: torch.Tensor,
         predictor_output: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward one step for streaming inference.
+        Single step forward pass for streaming inference.
         
         Args:
-            encoder_output: Encoder output of shape (batch_size, encoder_dim)
-            predictor_output: Predictor output of shape (batch_size, predictor_dim)
+            encoder_output: Output from encoder (B, D_enc)
+            predictor_output: Output from predictor (B, D_pred)
             
         Returns:
-            Joint output of shape (batch_size, vocab_size)
+            Joint output (B, V)
         """
-        # Check if inputs require gradients
+        # Check for NaN values in inputs
+        if torch.isnan(encoder_output).any():
+            logger.warning("NaN values detected in encoder output")
+        if torch.isnan(predictor_output).any():
+            logger.warning("NaN values detected in predictor output")
+        
+        # Check if inputs require gradients - log warning but don't modify tensors
         if not encoder_output.requires_grad:
-            print("WARNING: Encoder output does not require gradients in joint network step!")
-            # Ensure encoder output requires gradients
-            encoder_output = encoder_output.detach().requires_grad_(True)
-            
+            logger.warning("Encoder output doesn't require gradients - this may cause issues in training")
         if not predictor_output.requires_grad:
-            print("WARNING: Predictor output does not require gradients in joint network step!")
-            # Ensure predictor output requires gradients
-            predictor_output = predictor_output.detach().requires_grad_(True)
-            
-        # Project encoder output
-        encoder_proj = self.encoder_proj(encoder_output)  # (batch_size, hidden_dim)
-        encoder_proj = self.encoder_norm(encoder_proj)
+            logger.warning("Predictor output doesn't require gradients - this may cause issues in training")
         
-        # Project predictor output
-        predictor_proj = self.predictor_proj(predictor_output)  # (batch_size, hidden_dim)
-        predictor_proj = self.predictor_norm(predictor_proj)
+        # Project encoder output (B, D_enc) -> (B, D_h)
+        encoder_proj = self.encoder_proj(encoder_output)
+        encoder_proj = self.dropout_layer(encoder_proj)
         
-        # Combine outputs - use addition instead of scaling
-        joint = encoder_proj + predictor_proj  # (batch_size, hidden_dim)
+        # Project predictor output (B, D_pred) -> (B, D_h)
+        predictor_proj = self.predictor_proj(predictor_output)
+        predictor_proj = self.dropout_layer(predictor_proj)
         
-        # Apply layer normalization
-        joint = self.joint_norm(joint)
+        # Sum projections
+        # (B, D_h) + (B, D_h) -> (B, D_h)
+        joint = encoder_proj + predictor_proj
         
-        # Apply activation and dropout
+        # Apply activation
         joint = self.activation(joint)
-        joint = self.dropout(joint)
         
-        # Project to vocabulary
-        output = self.output_proj(joint)  # (batch_size, vocab_size)
+        # Apply normalization if needed
+        if self.norm is not None:
+            if self.norm_2d:  # BatchNorm1d
+                joint = self.norm(joint.unsqueeze(1)).squeeze(1)
+            else:  # LayerNorm
+                joint = self.norm(joint)
         
-        # Check for NaN values
-        if torch.isnan(output).any():
-            print("WARNING: NaN values detected in joint network step outputs!")
-            output = torch.nan_to_num(output, nan=0.0)
+        # Apply dropout and project to vocabulary dimension
+        joint = self.joint_dropout_layer(joint)
         
-        # Check if output requires gradients
-        if not output.requires_grad:
-            print("WARNING: Joint network step output does not require gradients!")
+        # (B, D_h) -> (B, V)
+        logits = self.output_proj(joint)
         
-        return output 
+        return logits 
