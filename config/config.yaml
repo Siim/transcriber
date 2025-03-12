@@ -55,7 +55,7 @@ training:
   save_interval: 5000
   early_stopping_patience: 5
   scheduler: "constant"  # Options: "linear", "cosine", "constant"
-  use_fp16: true  # Enable mixed precision training for faster performance
+  use_fp16: false  # Enable mixed precision training for faster performance
   gradient_accumulation_steps: 4  # Process smaller batches but maintain effective batch size
 
 # Tokenizer configuration
