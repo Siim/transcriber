@@ -19,8 +19,8 @@ model:
     pretrained_model_name: "facebook/wav2vec2-large-xlsr-53"
     freeze_feature_encoder: true
     freeze_base_model: false
-    dropout: 0.1
-    layerdrop: 0.1
+    dropout: 0.0
+    layerdrop: 0.0
     attention_mask_type: "chunk"  # Options: "full", "chunk", "attention_sink"
     chunk_size: 10  # Number of frames in each chunk for streaming
     left_context: 25  # Number of frames to use as left context
@@ -42,10 +42,10 @@ model:
 # Training configuration
 training:
   num_epochs: 50
-  learning_rate: 0.0001
+  learning_rate: 0.00005
   weight_decay: 0.0001
   warmup_steps: 1000
-  grad_clip: 5.0
+  grad_clip: 1.0
   save_dir: "checkpoints"
   log_dir: "logs"
   output_dir: "outputs"
@@ -55,7 +55,7 @@ training:
   save_interval: 5000
   early_stopping_patience: 5
   scheduler: "linear"  # Options: "linear", "cosine", "constant"
-  use_fp16: true
+  use_fp16: false
 
 # Tokenizer configuration
 tokenizer:

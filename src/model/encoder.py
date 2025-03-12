@@ -310,15 +310,24 @@ class XLSREncoder(nn.Module):
     ):
         super().__init__()
         
-        # Load pretrained model
-        self.model = Wav2Vec2Model.from_pretrained(pretrained_model_name)
-        config = self.model.config
+        # Load pretrained model with modified config
+        from transformers import Wav2Vec2Config
+        config = Wav2Vec2Config.from_pretrained(pretrained_model_name)
+        
+        # Disable masking for fine-tuning
+        config.mask_time_prob = 0.0
+        config.mask_time_length = 1
+        config.mask_feature_prob = 0.0
+        config.mask_feature_length = 1
         
         # Set dropout and layerdrop
         config.hidden_dropout = dropout
         config.attention_dropout = dropout
         config.activation_dropout = dropout
         config.layerdrop = layerdrop
+        
+        # Load model with modified config
+        self.model = Wav2Vec2Model.from_pretrained(pretrained_model_name, config=config)
         
         # Explicitly set model to training mode (important for feature extractor)
         self.model.train()

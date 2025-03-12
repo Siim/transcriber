@@ -89,7 +89,8 @@ class AudioPreprocessor:
             self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
                 "facebook/wav2vec2-large-xlsr-53",
                 sampling_rate=self.sample_rate,
-                return_attention_mask=True
+                return_attention_mask=True,
+                do_normalize=True  # Ensure normalization is enabled
             )
     
     def __call__(
@@ -118,8 +119,12 @@ class AudioPreprocessor:
             if waveform.shape[1] > max_samples:
                 waveform = waveform[:, :max_samples]
         
-        # Convert to numpy array
+        # Convert to numpy array and normalize to [-1, 1] range if not already
         waveform = waveform.squeeze().numpy()
+        
+        # Ensure the waveform is in the range [-1, 1]
+        if np.max(np.abs(waveform)) > 1.0:
+            waveform = waveform / np.max(np.abs(waveform))
         
         # Process with feature extractor
         inputs = self.feature_extractor(
