@@ -157,18 +157,33 @@ class StreamingWav2Vec2Attention(nn.Module):
         
         # Apply attention mask if provided
         if attention_mask is not None:
-            # First, ensure attention_mask is 2D (batch_size, seq_len)
+            # First, handle attention_mask with any number of dimensions
+            # Debug: print the shape
+            print(f"Original attention_mask shape: {attention_mask.shape}")
+            
+            # Ensure we have a 2D attention mask [batch_size, seq_len]
             if attention_mask.dim() > 2:
-                attention_mask = attention_mask.squeeze()  # Remove extra dimensions
+                # Flatten all extra dimensions
+                while attention_mask.dim() > 2:
+                    attention_mask = attention_mask.squeeze(1)
+                print(f"Squeezed attention_mask shape: {attention_mask.shape}")
             
-            # Convert mask from [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
-            # Then expand to [batch_size, num_heads, seq_len, seq_len]
-            expanded_attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            expanded_attn_mask = (1.0 - expanded_attn_mask) * -10000.0  # Convert 0s to -10000, 1s to 0
+            # Create a 4D attention mask [batch_size, 1, 1, seq_len]
+            expanded_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            print(f"Expanded mask shape after unsqueeze: {expanded_mask.shape}")
             
-            attn_weights = attn_weights.view(bsz, self.num_heads, seq_len, seq_len)
-            attn_weights = attn_weights + expanded_attn_mask.expand(-1, self.num_heads, seq_len, -1)
-            attn_weights = attn_weights.view(bsz * self.num_heads, seq_len, seq_len)
+            # Create attention mask where 0s -> -10000.0 and 1s -> 0.0
+            attention_mask_float = (1.0 - expanded_mask) * -10000.0
+            print(f"Final attention_mask_float shape: {attention_mask_float.shape}")
+            
+            # Reshape attention weights to 4D [batch_size, num_heads, seq_len, seq_len]
+            attn_weights_4d = attn_weights.view(bsz, self.num_heads, seq_len, seq_len)
+            
+            # Add the mask to the attention weights
+            attn_weights_4d = attn_weights_4d + attention_mask_float
+            
+            # Reshape back to 3D [batch_size * num_heads, seq_len, seq_len]
+            attn_weights = attn_weights_4d.view(bsz * self.num_heads, seq_len, seq_len)
         
         # Apply softmax and dropout
         attn_weights = F.softmax(attn_weights, dim=-1)
