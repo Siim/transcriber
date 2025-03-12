@@ -142,6 +142,70 @@ class EstonianASRDataset(Dataset):
         """Return the number of samples in the dataset."""
         return len(self.samples)
     
+    def _preprocess_audio(self, audio_path: str) -> torch.Tensor:
+        """
+        Load and preprocess audio more efficiently.
+        Limits audio length to max_duration.
+        
+        Args:
+            audio_path: Path to the audio file
+            
+        Returns:
+            Preprocessed audio tensor with shape [1, length]
+        """
+        try:
+            # Check if file exists
+            if not os.path.exists(audio_path):
+                if self.debug:
+                    print(f"Debug mode: Using dummy audio for missing file: {audio_path}")
+                    # Generate a short dummy audio
+                    return torch.zeros(1, 16000) + torch.randn(1, 16000) * 1e-6
+                else:
+                    raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            
+            # Load audio
+            waveform, sample_rate = torchaudio.load(audio_path)
+            
+            # Convert to mono if needed - ensure shape is [1, length]
+            if waveform.dim() > 1:
+                if waveform.shape[0] > 1:
+                    waveform = waveform.mean(dim=0, keepdim=True)
+            else:
+                # If for some reason it's 1D, make it 2D [1, length]
+                waveform = waveform.unsqueeze(0)
+            
+            # Resample if needed
+            if sample_rate != 16000:
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=sample_rate, new_freq=16000
+                )
+                waveform = resampler(waveform)
+            
+            # Limit audio length to max_duration to prevent extremely long sequences
+            if self.max_duration is not None:
+                max_samples = int(self.max_duration * 16000)
+                if waveform.shape[1] > max_samples:
+                    # Either take the first max_samples (consistent) or randomly crop (for data augmentation)
+                    # using consistent for now for stability
+                    waveform = waveform[:, :max_samples]
+            
+            # Normalize audio
+            if waveform.abs().max() > 0:
+                waveform = waveform / waveform.abs().max()
+            
+            # Ensure the shape is exactly [1, length]
+            if waveform.dim() > 2:
+                waveform = waveform.view(1, -1)
+                
+            return waveform
+        
+        except Exception as e:
+            if self.debug:
+                print(f"Error loading audio {audio_path}: {str(e)}. Using dummy audio.")
+                return torch.zeros(1, 16000) + torch.randn(1, 16000) * 1e-6
+            else:
+                raise
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a sample from the dataset."""
         sample = self.samples[idx]
@@ -149,15 +213,16 @@ class EstonianASRDataset(Dataset):
         # Process audio and text
         if sample.get("missing_audio", False):
             # Generate dummy audio for missing files
-            # Use a short, fixed-length audio tensor of zeros
-            dummy_audio = torch.zeros(16000)  # 1 second of silence at 16kHz
+            dummy_audio = torch.zeros(1, 16000) + torch.randn(1, 16000) * 1e-6  # Add small noise to prevent NaN
             processed = self.processor(
                 audio=dummy_audio,
                 text=sample["text"]
             )
         else:
+            # Use optimized audio preprocessing
+            audio = self._preprocess_audio(sample["audio_path"])
             processed = self.processor(
-                audio_path=sample["audio_path"],
+                audio=audio,
                 text=sample["text"]
             )
         
@@ -167,119 +232,104 @@ class EstonianASRDataset(Dataset):
         return processed
 
 
-def collate_fn(batch: List[Dict[str, torch.Tensor]], vocab_size: int = 60) -> Dict[str, torch.Tensor]:
+def collate_fn(batch, max_input_length=None, debug=False):
     """
-    Robust collate function for DataLoader.
+    Collate function for the DataLoader.
     
     Args:
         batch: List of samples from the dataset
-        vocab_size: Size of the vocabulary for clamping label values
+        max_input_length: Maximum input length to limit sequence length
+        debug: Whether to print debug information
         
     Returns:
-        Batched samples with padded sequences
+        Dictionary with batched tensors
     """
-    # Filter out any samples with empty tensors
+    # Filter out samples with empty tensors
     valid_batch = []
     for sample in batch:
-        if all(k in sample for k in ["input_values", "labels", "speaker_id"]):
-            if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
-                # Check if any labels are out of range and clip them
-                if (sample["labels"] >= vocab_size).any():
-                    print(f"WARNING: Found label values >= vocab_size ({vocab_size}). Clipping to valid range.")
-                    sample["labels"] = torch.clamp(sample["labels"], max=vocab_size-1)
-                valid_batch.append(sample)
-            else:
-                print(f"Skipping sample with empty tensor: input_values shape={sample['input_values'].shape}, labels shape={sample['labels'].shape}")
+        # Skip samples with empty input values
+        if sample["input_values"].numel() == 0:
+            continue
+            
+        # Skip samples with labels that exceed vocabulary size
+        if torch.max(sample["labels"]) >= sample["processor"].tokenizer.vocab_size:
+            print(f"WARNING: Label exceeds vocabulary size: {torch.max(sample['labels']).item()} >= {sample['processor'].tokenizer.vocab_size}")
+            continue
+            
+        valid_batch.append(sample)
     
-    # If the entire batch is invalid, create a dummy batch
+    # If all samples are invalid, create a dummy batch
     if len(valid_batch) == 0:
-        print("WARNING: Entire batch invalid, creating dummy batch")
-        # Create a dummy sample with valid data
-        dummy_sample = {
-            "input_values": torch.zeros(1, 16000),  # 1 second at 16kHz
-            "labels": torch.ones(1, dtype=torch.long),  # Single token
-            "speaker_id": torch.tensor(0, dtype=torch.long)
+        print("WARNING: All samples in batch are invalid, creating dummy batch")
+        return {
+            "input_values": torch.zeros(1, 1, 1000),
+            "attention_mask": torch.zeros(1, 1000),
+            "labels": torch.zeros(1, 1, dtype=torch.long),
+            "label_lengths": torch.ones(1, dtype=torch.long),
+            "speaker_id": torch.zeros(1, dtype=torch.long)
         }
-        valid_batch = [dummy_sample, dummy_sample]  # Need at least 2 samples
     
-    # Get max lengths
-    max_input_length = max(x["input_values"].shape[1] for x in valid_batch)
-    max_label_length = max(max(x["labels"].shape[0], 1) for x in valid_batch)  # Ensure at least length 1
-    
-    # Initialize tensors
+    # Get batch size and maximum lengths
     batch_size = len(valid_batch)
-    input_values = torch.zeros(batch_size, 1, max_input_length)
-    attention_mask = torch.zeros(batch_size, max_input_length, dtype=torch.long)
+    max_input_length_in_batch = max([sample["input_values"].shape[-1] for sample in valid_batch])
     
-    # Determine pad token - use first token of first sample's labels, or 0 if unavailable
-    pad_token = valid_batch[0]["labels"][0].item() if valid_batch[0]["labels"].numel() > 0 else 0
+    # Limit input length if specified
+    if max_input_length is not None and max_input_length > 0:
+        max_input_length_in_batch = min(max_input_length_in_batch, max_input_length)
+        if debug:
+            print(f"Limiting maximum sequence length to {max_input_length_in_batch}")
+    
+    max_label_length = max([sample["labels"].shape[0] for sample in valid_batch])
+    
+    # Initialize input tensors with zeros
+    input_values = torch.zeros(batch_size, max_input_length_in_batch)
+    attention_mask = torch.zeros(batch_size, max_input_length_in_batch)
+    
+    # Determine pad token - use a default of 0
+    pad_token = 0
     
     # Initialize labels with pad tokens
     labels = torch.full((batch_size, max_label_length), pad_token, dtype=torch.long)
-    label_lengths = torch.ones(batch_size, dtype=torch.long)  # Initialize with 1 (minimum valid length)
+    label_lengths = torch.zeros(batch_size, dtype=torch.long)
     speaker_ids = torch.zeros(batch_size, dtype=torch.long)
     
-    # Fill tensors with robust handling
+    # Fill tensors efficiently
     for i, sample in enumerate(valid_batch):
-        # Process input values
-        input_length = min(sample["input_values"].shape[1], max_input_length)
-        input_values[i, 0, :input_length] = sample["input_values"][:, :input_length]
+        # Extract input values (make sure it's 2D)
+        # Handle potentially different shapes by getting the raw tensor
+        if sample["input_values"].dim() == 3:  # [1, 1, length]
+            sample_input = sample["input_values"].squeeze(0)
+        elif sample["input_values"].dim() == 2:  # [1, length]
+            sample_input = sample["input_values"]
+        else:  # Just in case
+            sample_input = sample["input_values"].view(1, -1)
+            
+        # Input values and attention mask
+        input_length = min(sample_input.shape[1], max_input_length_in_batch)
+        input_values[i, :input_length] = sample_input[0, :input_length]
         attention_mask[i, :input_length] = 1
         
-        # Process labels
-        label_tensor = sample["labels"]
-        label_length = min(label_tensor.shape[0], max_label_length)
-        
-        # Ensure label_length is at least 1
-        if label_length == 0:
-            label_length = 1
-            label_tensor = torch.full((1,), pad_token, dtype=torch.long, device=label_tensor.device)
-        
-        # Fill labels and set length
-        labels[i, :label_length] = label_tensor[:label_length]
+        # Labels
+        label_length = sample["labels"].shape[0]
         label_lengths[i] = label_length
+        labels[i, :label_length] = sample["labels"]
         
-        # Set speaker ID
+        # Speaker ID
         speaker_ids[i] = sample["speaker_id"]
     
-    # Validate the tensors
-    try:
-        # Check for NaN values
-        for name, tensor in [
-            ("input_values", input_values), 
-            ("labels", labels), 
-            ("label_lengths", label_lengths)
-        ]:
-            if torch.isnan(tensor.float()).any():
-                print(f"WARNING: NaN values in {name} after collation!")
-                tensor = torch.nan_to_num(tensor.float(), nan=0.0)
-                if name == "labels" or name == "label_lengths":
-                    tensor = tensor.long()
-        
-        # Ensure label_lengths are valid
-        label_lengths = torch.clamp(label_lengths, min=1, max=max_label_length)
-        
-        # Squeeze input_values to match expected format
-        input_values = input_values.squeeze(1)  # [batch, 1, length] -> [batch, length]
-        
+    # Add channel dimension - XLSR expects [batch_size, 1, sequence_length]
+    input_values = input_values.unsqueeze(1)
+    
+    # Debug information for batch shapes
+    if debug:
         print(f"DEBUG - Batch shapes: input={input_values.shape}, attn={attention_mask.shape}, labels={labels.shape}, lengths={label_lengths.shape}")
-    except Exception as e:
-        print(f"ERROR in collate_fn: {e}")
-        # Return minimal valid batch as fallback
-        return {
-            "input_values": torch.zeros(batch_size, 16000),
-            "attention_mask": torch.ones(batch_size, 16000, dtype=torch.long),
-            "labels": torch.ones(batch_size, 1, dtype=torch.long),
-            "label_lengths": torch.ones(batch_size, dtype=torch.long),
-            "speaker_ids": torch.zeros(batch_size, dtype=torch.long)
-        }
     
     return {
         "input_values": input_values,
         "attention_mask": attention_mask,
         "labels": labels,
         "label_lengths": label_lengths,
-        "speaker_ids": speaker_ids
+        "speaker_id": speaker_ids
     }
 
 

@@ -289,9 +289,13 @@ class XLSRTransducerProcessor:
         """Process audio file or tensor."""
         if audio is not None:
             # Process audio tensor directly
+            # Ensure we have a 2D tensor [channels, length]
             if audio.dim() == 1:
-                # Add batch dimension if needed
+                # Add channel dimension if needed
                 audio = audio.unsqueeze(0)
+            elif audio.dim() > 2:
+                # If somehow we have more dimensions, reshape to [1, length]
+                audio = audio.view(1, -1)
             
             # Verify audio tensor
             audio = self.audio_preprocessor._verify_audio(audio, self.audio_preprocessor.sample_rate, "direct_tensor")
@@ -302,7 +306,7 @@ class XLSRTransducerProcessor:
                 if audio.shape[1] > max_samples:
                     audio = audio[:, :max_samples]
             
-            # Convert to numpy array
+            # Convert to numpy array - feature extractor expects 1D array for single audio
             audio_np = audio.squeeze().numpy()
             
             # Process with feature extractor

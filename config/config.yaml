@@ -7,7 +7,7 @@ data:
   test_manifest: "data/test_list.txt"
   audio_dir: ""
   sample_rate: 16000
-  max_duration: 30.0
+  max_duration: 10.0  # Reduced from 30.0 to limit sequence lengths
   min_duration: 0.5
   batch_size: 12
   num_workers: 8
@@ -21,10 +21,10 @@ model:
     freeze_base_model: false
     dropout: 0.0
     layerdrop: 0.0
-    attention_mask_type: "chunk"  # Options: "full", "chunk", "attention_sink"
-    chunk_size: 10  # Number of frames in each chunk for streaming
-    left_context: 25  # Number of frames to use as left context
-    right_context: 0  # Number of frames to use as right context
+    attention_mask_type: "chunk"  # Using chunked attention for streaming
+    chunk_size: 32  # ~640ms as recommended in the paper (32 frames @ 20ms stride)
+    left_context: 32  # One chunk of left context
+    right_context: 0  # No future context for streaming capability
     attention_sink_size: 4  # Number of frames to use as attention sink
   
   # Predictor network configuration
@@ -55,13 +55,13 @@ training:
   save_interval: 5000
   early_stopping_patience: 5
   scheduler: "constant"  # Options: "linear", "cosine", "constant"
-  use_fp16: false
-  gradient_accumulation_steps: 4
+  use_fp16: true  # Enable mixed precision training for faster performance
+  gradient_accumulation_steps: 4  # Process smaller batches but maintain effective batch size
 
 # Tokenizer configuration
 tokenizer:
-  type: "bpe"  # Change from "character" to "bpe"
-  vocab_size: 1000  # Start with 1000, experiment up to 5000
+  type: "bpe"  # Using BPE tokenizer for more efficient token sequences
+  vocab_size: 1000
   # For character tokenizer, vocab_size is determined by the alphabet plus special tokens
   # For BPE tokenizer, you would set an explicit vocab_size (e.g., 1000-5000)
   # Estonian alphabet + digits + punctuation + special tokens requires ~60 tokens
@@ -76,5 +76,5 @@ tokenizer:
 inference:
   beam_size: 5
   max_length: 100
-  streaming_chunk_size: 10
-  streaming_buffer_size: 30 
+  streaming_chunk_size: 32  # Match training chunk size
+  streaming_buffer_size: 64  # Sufficient buffer for streaming 

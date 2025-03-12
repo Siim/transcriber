@@ -483,7 +483,7 @@ class XLSREncoder(nn.Module):
         Forward pass of the encoder.
         
         Args:
-            input_values: Input tensor of shape (batch_size, seq_len)
+            input_values: Input tensor of shape (batch_size, seq_len) or (batch_size, 1, seq_len)
             attention_mask: Optional mask of shape (batch_size, seq_len)
             output_hidden_states: Whether to return all hidden states
             
@@ -492,6 +492,17 @@ class XLSREncoder(nn.Module):
                 - last_hidden_state: Output tensor of shape (batch_size, seq_len, hidden_size)
                 - hidden_states: Optional tuple of hidden states
         """
+        # Fix shape issues - wav2vec2 expects input of shape [batch_size, seq_len]
+        # or [batch_size, 1, seq_len] (with channel dimension)
+        if input_values.dim() == 4:  # [batch_size, 1, 1, seq_len]
+            # Remove extra dimension
+            input_values = input_values.squeeze(2)
+        elif input_values.dim() > 4:
+            # Some other weird shape
+            batch_size = input_values.shape[0]
+            seq_len = input_values.shape[-1]
+            input_values = input_values.reshape(batch_size, 1, seq_len)
+            
         # Update streaming configuration for this batch
         if self.training and self.randomize_chunks:
             self.update_streaming_config()
@@ -508,20 +519,32 @@ class XLSREncoder(nn.Module):
         # Custom forward pass to add stability
         # First, run the feature extractor separately
         with torch.no_grad():
-            # Extract features
-            extract_features = self.model.feature_extractor(input_values)
-            extract_features = extract_features.transpose(1, 2)
-            
-            # Apply layer norm to stabilize feature extractor output
-            extract_features = self.feature_norm(extract_features)
-            
-            # Clip extreme values
-            extract_features = torch.clamp(extract_features, min=-10.0, max=10.0)
-            
-            # Check for NaN in feature extractor output
-            if torch.isnan(extract_features).any():
-                print("WARNING: NaN values detected after feature extraction!")
-                extract_features = torch.nan_to_num(extract_features, nan=0.0)
+            try:
+                # Make sure input_values has the right shape for the feature extractor
+                # The feature extractor expects [batch_size, sequence_length]
+                if input_values.dim() == 3:  # [batch_size, 1, sequence_length]
+                    feature_input = input_values.squeeze(1)
+                else:
+                    feature_input = input_values
+                
+                # Extract features
+                extract_features = self.model.feature_extractor(feature_input)
+                extract_features = extract_features.transpose(1, 2)
+                
+                # Apply layer norm to stabilize feature extractor output
+                extract_features = self.feature_norm(extract_features)
+                
+                # Clip extreme values
+                extract_features = torch.clamp(extract_features, min=-10.0, max=10.0)
+                
+                # Check for NaN in feature extractor output
+                if torch.isnan(extract_features).any():
+                    print("WARNING: NaN values detected after feature extraction!")
+                    extract_features = torch.nan_to_num(extract_features, nan=0.0)
+            except RuntimeError as e:
+                print(f"ERROR in feature extraction: {e}")
+                print(f"Input shape was: {input_values.shape}")
+                raise
         
         # Then run the rest of the model
         if attention_mask is not None:

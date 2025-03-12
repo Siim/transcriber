@@ -17,37 +17,37 @@ from data.processor import XLSRTransducerProcessor
 
 
 # Define robust collate function outside the Trainer class to make it picklable
-def robust_collate_fn(batch, processor=None, logger=None):
+def robust_collate_fn(
+    batch: List[Dict[str, torch.Tensor]], 
+    processor: Optional[XLSRTransducerProcessor] = None,
+    logger: Optional[logging.Logger] = None,
+    max_input_length: Optional[int] = None,
+    debug: bool = False
+) -> Dict[str, torch.Tensor]:
     """
-    Enhanced collate function that handles potential errors in batches.
-    Ensures label values are within the valid vocabulary range.
+    Wrapper around collate_fn that handles edge cases and adds logging.
+    
+    Args:
+        batch: List of samples from the dataset
+        processor: Processor for audio and text
+        logger: Logger for warnings
+        max_input_length: Maximum input length to limit sequence length
+        debug: Whether to print debug information
+        
+    Returns:
+        Dictionary with batched tensors
     """
-    import torch
-    
-    # Get the vocab_size if processor is available
-    vocab_size = 60  # Default fallback
-    if processor is not None:
-        vocab_size = processor.vocab_size
-    
-    # Filter out any problematic samples
+    # Filter out samples with missing keys or empty tensors
     valid_batch = []
     for sample in batch:
-        # Check if all required keys are present and not empty
-        if all(k in sample and sample[k] is not None for k in ["input_values", "labels", "speaker_id"]):
+        if all(k in sample for k in ["input_values", "labels", "speaker_id"]):
             if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
-                # Check if any labels are out of range
-                if (sample["labels"] >= vocab_size).any():
-                    if logger:
-                        logger.warning(f"Found label values >= vocab_size ({vocab_size}). Clipping to valid range.")
-                    # Clip label values to be within valid range
-                    sample["labels"] = torch.clamp(sample["labels"], max=vocab_size-1)
+                # Add processor to each sample for vocabulary size check
+                if processor is not None:
+                    sample["processor"] = processor
                 valid_batch.append(sample)
-            else:
-                if logger:
-                    logger.warning(f"Skipping sample with empty tensors: {sample.keys()}")
-        else:
-            if logger:
-                logger.warning(f"Skipping sample with missing keys: {sample.keys()}")
+            elif debug and logger:
+                logger.debug(f"Skipping sample with empty tensor: input={sample['input_values'].shape}, labels={sample['labels'].shape}")
     
     # If we have no valid samples, create a dummy batch with minimal inputs
     if len(valid_batch) == 0:
@@ -61,12 +61,17 @@ def robust_collate_fn(batch, processor=None, logger=None):
         dummy_sample = {
             "input_values": torch.zeros(1, 16000),  # 1 second at 16kHz
             "labels": torch.tensor([blank_id], dtype=torch.long),
-            "speaker_id": torch.tensor([0], dtype=torch.long)
+            "speaker_id": torch.tensor([0], dtype=torch.long),
+            "processor": processor
         }
         valid_batch = [dummy_sample, dummy_sample]  # Need at least 2 for batch
     
-    # Use the original collate function with the valid batch
-    return collate_fn(valid_batch, vocab_size=vocab_size)
+    # Use the optimized collate function with the valid batch
+    return collate_fn(
+        valid_batch, 
+        max_input_length=max_input_length,
+        debug=debug
+    )
 
 
 @dataclass
@@ -266,8 +271,21 @@ class XLSRTransducerTrainer:
             leave=False,
         )
         
+        # Performance tracking
+        batch_times = []
+        memory_usage = []
+        
+        # Log memory usage at the start
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            start_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+            self.logger.info(f"Initial GPU memory usage: {start_memory:.2f}GB")
+        
         # Training loop
         for batch_idx, batch in enumerate(self.train_dataloader):
+            # Track batch start time
+            batch_start_time = time.time()
+            
             # Move batch to device
             batch = {k: v.to(self.device) for k, v in batch.items()}
             
@@ -414,6 +432,11 @@ class XLSRTransducerTrainer:
             # Update progress bar
             progress_bar.update(1)
             progress_bar.set_postfix({"loss": loss.item()})
+            
+            # Performance tracking
+            batch_times.append(time.time() - batch_start_time)
+            if torch.cuda.is_available():
+                memory_usage.append(torch.cuda.memory_allocated() / (1024 ** 3) - start_memory)
         
         # Close progress bar
         progress_bar.close()
@@ -426,6 +449,16 @@ class XLSRTransducerTrainer:
             f"Epoch {self.epoch + 1}: loss = {avg_loss:.4f}, "
             f"time = {elapsed_time:.2f}s"
         )
+        
+        # Log performance summary
+        self.logger.info(f"Average batch time: {np.mean(batch_times):.4f}s")
+        self.logger.info(f"Maximum batch time: {max(batch_times):.4f}s")
+        self.logger.info(f"Minimum batch time: {min(batch_times):.4f}s")
+        
+        if torch.cuda.is_available():
+            peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            self.logger.info(f"Peak GPU memory usage: {peak_memory:.2f}GB")
+            self.logger.info(f"Memory usage: {np.mean(memory_usage):.2f}GB")
         
         return {
             "train_loss": avg_loss,
@@ -773,12 +806,18 @@ class Trainer:
             num_workers = 0
             self.logger.info(f"Debug mode: Using batch_size={batch_size}, num_workers={num_workers}")
         
+        # Calculate maximum input length in samples (e.g., 10 seconds worth)
+        max_input_length = None
+        if max_duration := data_config.get("max_duration", None):
+            max_input_length = int(max_duration * self.processor.audio_preprocessor.sample_rate)
+            self.logger.info(f"Limiting maximum sequence length to {max_input_length} samples ({max_duration}s)")
+        
         train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger),
+            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger, max_input_length),
             pin_memory=(num_workers > 0)  # Only use pin_memory with workers
         )
         
@@ -787,7 +826,7 @@ class Trainer:
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger),
+            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger, max_input_length),
             pin_memory=(num_workers > 0)  # Only use pin_memory with workers
         )
         
