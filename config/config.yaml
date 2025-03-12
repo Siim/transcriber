@@ -2,9 +2,9 @@
 
 # Data configuration
 data:
-  train_manifest: "data/train_manifest.txt"
-  valid_manifest: "data/valid_manifest.txt"
-  test_manifest: "data/test_manifest.txt"
+  train_manifest: "data/train_list.txt"
+  valid_manifest: "data/valid_list.txt"
+  test_manifest: "data/test_list.txt"
   audio_dir: "estonian_corpora/processed"
   sample_rate: 16000
   max_duration: 30.0
