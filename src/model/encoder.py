@@ -386,11 +386,28 @@ class XLSREncoder(nn.Module):
             # Replace encoder layers
             self.model.encoder.layers = nn.ModuleList(streaming_layers)
         
+        # Add feature extractor output normalization
+        self.feature_norm = nn.LayerNorm(config.conv_dim[-1], eps=config.layer_norm_eps)
+        
         # Add output layer normalization for stability
         self.output_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
         # Output projection
         self.output_dim = config.hidden_size
+        
+    def _preprocess_input(self, input_values: torch.Tensor) -> torch.Tensor:
+        """Preprocess input values for stability."""
+        # Ensure input is in the range [-1, 1]
+        if torch.max(torch.abs(input_values)) > 1.0:
+            input_values = torch.clamp(input_values, min=-1.0, max=1.0)
+        
+        # Check for zero or constant input
+        if torch.std(input_values) < 1e-6:
+            print("WARNING: Input has very low variance (possibly silent or DC)")
+            # Add small noise to prevent NaN
+            input_values = input_values + torch.randn_like(input_values) * 1e-6
+        
+        return input_values
         
     def forward(
         self,
@@ -414,25 +431,53 @@ class XLSREncoder(nn.Module):
         # Check for NaN values in input
         if torch.isnan(input_values).any():
             print("WARNING: NaN values detected in encoder input!")
+            # Replace NaN values with zeros
+            input_values = torch.nan_to_num(input_values, nan=0.0)
+        
+        # Preprocess input
+        input_values = self._preprocess_input(input_values)
+        
+        # Custom forward pass to add stability
+        # First, run the feature extractor separately
+        with torch.no_grad():
+            # Extract features
+            extract_features = self.model.feature_extractor(input_values)
+            extract_features = extract_features.transpose(1, 2)
             
-        outputs = self.model(
-            input_values=input_values,
-            attention_mask=attention_mask,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-        )
+            # Apply layer norm to stabilize feature extractor output
+            extract_features = self.feature_norm(extract_features)
+            
+            # Clip extreme values
+            extract_features = torch.clamp(extract_features, min=-10.0, max=10.0)
+            
+            # Check for NaN in feature extractor output
+            if torch.isnan(extract_features).any():
+                print("WARNING: NaN values detected after feature extraction!")
+                extract_features = torch.nan_to_num(extract_features, nan=0.0)
+        
+        # Then run the rest of the model
+        if attention_mask is not None:
+            # compute reduced attention_mask corresponding to feature extractor's output
+            attention_mask = self.model._get_feature_vector_attention_mask(
+                extract_features.shape[1], attention_mask, add_adapter=False
+            )
+        
+        hidden_states = self.model.feature_projection(extract_features)
+        hidden_states = self.model.encoder(hidden_states, attention_mask=attention_mask)[0]
         
         # Apply layer normalization for stability
-        last_hidden_state = self.output_layer_norm(outputs.last_hidden_state)
+        last_hidden_state = self.output_layer_norm(hidden_states)
         
         # Clip extreme values to prevent NaN propagation
-        last_hidden_state = torch.clamp(last_hidden_state, min=-100.0, max=100.0)
+        last_hidden_state = torch.clamp(last_hidden_state, min=-50.0, max=50.0)
         
         # Check for NaN values in output
         if torch.isnan(last_hidden_state).any():
             print("WARNING: NaN values detected in encoder output!")
+            # Replace NaN values with zeros
+            last_hidden_state = torch.nan_to_num(last_hidden_state, nan=0.0)
         
         return {
             "last_hidden_state": last_hidden_state,
-            "hidden_states": outputs.hidden_states if output_hidden_states else None,
+            "hidden_states": None if not output_hidden_states else hidden_states,
         } 

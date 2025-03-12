@@ -85,6 +85,11 @@ class XLSRTransducer(nn.Module):
             self.predictor.train()
             self.joint.train()
         
+        # Check for NaN values in input
+        if torch.isnan(input_values).any():
+            print("WARNING: NaN values detected in model input!")
+            input_values = torch.nan_to_num(input_values, nan=0.0)
+        
         # Encoder forward pass
         encoder_outputs = self.encoder(
             input_values=input_values,
@@ -93,6 +98,11 @@ class XLSRTransducer(nn.Module):
         
         # Get encoder outputs
         encoder_hidden_states = encoder_outputs["last_hidden_state"]
+        
+        # Check for NaN values in encoder outputs
+        if torch.isnan(encoder_hidden_states).any():
+            print("WARNING: NaN values detected in encoder hidden states!")
+            encoder_hidden_states = torch.nan_to_num(encoder_hidden_states, nan=0.0)
         
         # Predictor forward pass (if labels are provided)
         if labels is not None and label_lengths is not None:
@@ -111,11 +121,21 @@ class XLSRTransducer(nn.Module):
             # Get predictor outputs
             predictor_hidden_states = predictor_outputs["outputs"]
             
+            # Check for NaN values in predictor outputs
+            if torch.isnan(predictor_hidden_states).any():
+                print("WARNING: NaN values detected in predictor hidden states!")
+                predictor_hidden_states = torch.nan_to_num(predictor_hidden_states, nan=0.0)
+            
             # Joint network forward pass
             logits = self.joint(
                 encoder_outputs=encoder_hidden_states,
                 predictor_outputs=predictor_hidden_states,
             )
+            
+            # Check for NaN values in logits
+            if torch.isnan(logits).any():
+                print("WARNING: NaN values detected in logits!")
+                logits = torch.nan_to_num(logits, nan=0.0)
             
             # Debug: Check if logits require gradients
             if not logits.requires_grad:

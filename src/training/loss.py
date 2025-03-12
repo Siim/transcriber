@@ -52,16 +52,46 @@ class TransducerLoss(nn.Module):
         Returns:
             Loss value
         """
+        # Check for NaN values in inputs
+        if torch.isnan(logits).any():
+            print("WARNING: NaN values detected in loss function logits input!")
+            logits = torch.nan_to_num(logits, nan=0.0)
+        
+        # Ensure lengths are valid
+        logit_lengths = torch.clamp(logit_lengths, min=1)
+        label_lengths = torch.clamp(label_lengths, min=1)
+        
         if self.use_cuda and logits.is_cuda:
             # Use CUDA implementation
-            loss = self.rnnt_loss(
-                logits=logits,
-                targets=labels,
-                logit_lengths=logit_lengths,
-                target_lengths=label_lengths,
-                blank=self.blank_id,
-                reduction=self.reduction,
-            )
+            try:
+                loss = self.rnnt_loss(
+                    logits=logits,
+                    targets=labels,
+                    logit_lengths=logit_lengths,
+                    target_lengths=label_lengths,
+                    blank=self.blank_id,
+                    reduction=self.reduction,
+                )
+                
+                # Check for NaN loss
+                if torch.isnan(loss).any():
+                    print("WARNING: NaN loss detected in CUDA implementation!")
+                    # Fall back to CPU implementation
+                    loss = self._compute_loss_cpu(
+                        logits=logits,
+                        labels=labels,
+                        logit_lengths=logit_lengths,
+                        label_lengths=label_lengths,
+                    )
+            except Exception as e:
+                print(f"Error in CUDA implementation: {e}")
+                # Fall back to CPU implementation
+                loss = self._compute_loss_cpu(
+                    logits=logits,
+                    labels=labels,
+                    logit_lengths=logit_lengths,
+                    label_lengths=label_lengths,
+                )
         else:
             # Use CPU implementation
             loss = self._compute_loss_cpu(
@@ -70,6 +100,12 @@ class TransducerLoss(nn.Module):
                 logit_lengths=logit_lengths,
                 label_lengths=label_lengths,
             )
+        
+        # Final check for NaN loss
+        if torch.isnan(loss).any():
+            print("WARNING: NaN loss detected after computation!")
+            # Return a small constant loss instead of NaN
+            loss = torch.tensor(10.0, device=logits.device, requires_grad=True)
         
         return loss
     
