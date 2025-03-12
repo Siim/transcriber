@@ -45,7 +45,7 @@ ipython_config.py
 
 # ASR specific
 # Data files
-data/
+# data/
 *.wav
 *.mp3
 *.flac
