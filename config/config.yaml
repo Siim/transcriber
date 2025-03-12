@@ -1,0 +1,76 @@
+# XLSR-Transducer Configuration
+
+# Data configuration
+data:
+  train_manifest: "data/train_manifest.txt"
+  valid_manifest: "data/valid_manifest.txt"
+  test_manifest: "data/test_manifest.txt"
+  audio_dir: "estonian_corpora/processed"
+  sample_rate: 16000
+  max_duration: 30.0
+  min_duration: 0.5
+  batch_size: 8
+  num_workers: 4
+
+# Model configuration
+model:
+  # Encoder (XLSR-53) configuration
+  encoder:
+    pretrained_model_name: "facebook/wav2vec2-large-xlsr-53"
+    freeze_feature_encoder: true
+    freeze_base_model: false
+    dropout: 0.1
+    layerdrop: 0.1
+    attention_mask_type: "chunk"  # Options: "full", "chunk", "attention_sink"
+    chunk_size: 10  # Number of frames in each chunk for streaming
+    left_context: 25  # Number of frames to use as left context
+    right_context: 0  # Number of frames to use as right context
+    attention_sink_size: 4  # Number of frames to use as attention sink
+  
+  # Predictor network configuration
+  predictor:
+    embedding_dim: 256
+    hidden_dim: 640
+    num_layers: 2
+    dropout: 0.1
+  
+  # Joint network configuration
+  joint:
+    hidden_dim: 640
+    activation: "relu"
+
+# Training configuration
+training:
+  num_epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  warmup_steps: 1000
+  grad_clip: 5.0
+  save_dir: "checkpoints"
+  log_dir: "logs"
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+  early_stopping_patience: 5
+  scheduler: "linear"  # Options: "linear", "cosine", "constant"
+  use_fp16: true
+
+# Tokenizer configuration
+tokenizer:
+  type: "character"  # Options: "character", "bpe", "word"
+  # For character tokenizer, vocab_size is determined by the alphabet plus special tokens
+  # For BPE tokenizer, you would set an explicit vocab_size (e.g., 1000-5000)
+  # Estonian alphabet + digits + punctuation + special tokens requires ~60 tokens
+  special_tokens:
+    pad: "<pad>"
+    unk: "<unk>"
+    bos: "<s>"
+    eos: "</s>"
+    blank: "<blank>"
+
+# Inference configuration
+inference:
+  beam_size: 5
+  max_length: 100
+  streaming_chunk_size: 10
+  streaming_buffer_size: 30 
