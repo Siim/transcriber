@@ -529,6 +529,28 @@ class XLSREncoder(nn.Module):
             attention_mask = self.model._get_feature_vector_attention_mask(
                 extract_features.shape[1], attention_mask, add_adapter=False
             )
+            
+            # For scaled_dot_product_attention used in newer PyTorch versions,
+            # we need to properly format the attention mask for each layer
+            # The mask needs to be [batch_size, 1, seq_len, seq_len] 
+            # where 1s allow attention and 0s don't
+            batch_size, seq_len = attention_mask.shape
+            
+            # Create a square mask from the sequential mask
+            # First, create a square matrix where each row allows attention to previous positions
+            causal_mask = torch.tril(torch.ones((seq_len, seq_len), 
+                                               device=attention_mask.device))
+            
+            # Apply the batch's actual mask values to the causal mask
+            # Expand attention_mask to [batch_size, 1, 1, seq_len]
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            
+            # Combine with the causal mask (outer product)
+            # This creates a mask of shape [batch_size, 1, seq_len, seq_len]
+            extended_attention_mask = extended_attention_mask * causal_mask.unsqueeze(0)
+            
+            # Convert to the format expected by PyTorch (1.0 for positions to attend to)
+            attention_mask = extended_attention_mask
         
         # Apply feature projection
         feature_projection_output = self.model.feature_projection(extract_features)
@@ -559,21 +581,64 @@ class XLSREncoder(nn.Module):
         
         # Process through encoder layers
         for layer in self.model.encoder.layers:
-            if self.training and layer.dropout.p > 0:
-                # Apply layerdrop if training
-                dropout_probability = torch.rand(())
-                # Get layerdrop probability - handle different encoder implementations
-                layerdrop_prob = 0.0
-                if hasattr(self.model.encoder, "layerdrop"):
-                    layerdrop_prob = self.model.encoder.layerdrop
+            # Check if this is one of our streaming layers or an original HF layer
+            if isinstance(layer, StreamingWav2Vec2EncoderLayer):
+                # Handle our custom streaming layer
+                if self.training and layer.dropout.p > 0:
+                    # Apply layerdrop if training
+                    dropout_probability = torch.rand(())
+                    # Get layerdrop probability - handle different encoder implementations
+                    layerdrop_prob = 0.0
+                    if hasattr(self.model.encoder, "layerdrop"):
+                        layerdrop_prob = self.model.encoder.layerdrop
+                    else:
+                        # Fallback to the config value we set earlier
+                        layerdrop_prob = self.model.config.layerdrop if hasattr(self.model.config, "layerdrop") else 0.0
+                    
+                    if dropout_probability > layerdrop_prob:
+                        hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
                 else:
-                    # Fallback to the config value we set earlier
-                    layerdrop_prob = self.model.config.layerdrop if hasattr(self.model.config, "layerdrop") else 0.0
-                
-                if dropout_probability > layerdrop_prob:
                     hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
             else:
-                hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
+                # Handle original HF layer
+                # Note: transformers layers may have different interfaces
+                try:
+                    outputs = layer(hidden_states, attention_mask=attention_mask)
+                    
+                    # Handle various return types
+                    if isinstance(outputs, tuple):
+                        hidden_states = outputs[0]
+                    else:
+                        hidden_states = outputs
+                except Exception as e:
+                    print(f"Error in layer forward pass: {e}")
+                    print(f"Layer type: {type(layer)}")
+                    print(f"Attention mask shape: {attention_mask.shape if attention_mask is not None else None}")
+                    # Try fallback with different attention mask shape if needed
+                    try:
+                        # Reshape mask if necessary
+                        if attention_mask is not None and attention_mask.dim() == 4:
+                            # Make a simple binary mask for older HF layers
+                            simple_mask = (attention_mask.squeeze(1).sum(-1) > 0).float()
+                            outputs = layer(hidden_states, attention_mask=simple_mask)
+                        else:
+                            outputs = layer(hidden_states)
+                            
+                        # Handle various return types
+                        if isinstance(outputs, tuple):
+                            hidden_states = outputs[0]
+                        else:
+                            hidden_states = outputs
+                    except Exception as inner_e:
+                        print(f"Error in fallback attempt: {inner_e}")
+                        # Last resort: try without mask
+                        outputs = layer(hidden_states)
+                        
+                        # Handle various return types
+                        if isinstance(outputs, tuple):
+                            hidden_states = outputs[0]
+                        else:
+                            hidden_states = outputs
                 
             if encoder_states is not None:
                 encoder_states = encoder_states + (hidden_states,)
