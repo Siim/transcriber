@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple, Union, Callable
 from torch.utils.data import Dataset, DataLoader
 from .processor import XLSRTransducerProcessor
 import random
+from tqdm import tqdm
+import time
 
 
 class EstonianASRDataset(Dataset):
@@ -33,8 +35,17 @@ class EstonianASRDataset(Dataset):
             debug: Whether to run in debug mode (include missing files with dummy audio)
         """
         self.processor = processor
-        self.max_duration = max_duration
-        self.min_duration = min_duration
+        
+        # Enforce stricter duration limits for more efficient training
+        self.min_duration = max(1.0, min_duration) if min_duration is not None else 1.0
+        self.max_duration = min(10.0, max_duration) if max_duration is not None else 10.0
+        
+        if min_duration is not None and min_duration < 1.0:
+            print(f"Warning: min_duration {min_duration}s is less than recommended 1.0s. Using 1.0s.")
+            
+        if max_duration is not None and max_duration > 10.0:
+            print(f"Warning: max_duration {max_duration}s is greater than recommended 10.0s. Using 10.0s.")
+        
         self.audio_dir = audio_dir
         self.debug = debug
         
@@ -43,6 +54,15 @@ class EstonianASRDataset(Dataset):
         
         if len(self.samples) == 0:
             raise ValueError(f"No valid samples found in manifest: {manifest_path}")
+            
+        # Print duration statistics
+        if debug:
+            durations = [sample["duration"] for sample in self.samples]
+            if durations:
+                min_dur = min(durations)
+                max_dur = max(durations)
+                avg_dur = sum(durations) / len(durations)
+                print(f"Audio duration stats: min={min_dur:.2f}s, max={max_dur:.2f}s, avg={avg_dur:.2f}s")
     
     def _load_manifest(self, manifest_path: str) -> List[Dict[str, Union[str, int]]]:
         """Load and parse the manifest file."""
@@ -51,92 +71,119 @@ class EstonianASRDataset(Dataset):
         # Speaker ID mapping (for non-numeric speaker IDs)
         speaker_to_id = {}
         
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                parts = line.split("|")
-                if len(parts) != 3:
-                    print(f"Warning: Skipping malformed line: {line}")
-                    continue
-                
-                audio_path, text, speaker_id = parts
-                
-                # Convert speaker_id to a numeric value if it's not already numeric
-                if not speaker_id.isdigit():
-                    if speaker_id not in speaker_to_id:
-                        # Assign a new numeric ID to this speaker
-                        speaker_to_id[speaker_id] = len(speaker_to_id)
-                    speaker_id_numeric = speaker_to_id[speaker_id]
-                else:
-                    speaker_id_numeric = int(speaker_id)
-                
-                # If audio_dir is provided, join with audio_path
-                if self.audio_dir is not None:
-                    audio_path = os.path.join(self.audio_dir, audio_path)
-                
-                # Check if file exists
-                file_exists = os.path.exists(audio_path)
-                if not file_exists:
-                    if self.debug:
-                        # In debug mode, include the file with a flag indicating it's missing
-                        print(f"Debug mode: Using dummy audio for missing file: {audio_path}")
-                        samples.append({
-                            "audio_path": audio_path,
-                            "text": text,
-                            "speaker_id": speaker_id_numeric,
-                            "missing_audio": True
-                        })
-                        continue
-                    else:
-                        print(f"Warning: Audio file not found: {audio_path}")
-                        continue
-                
-                # Check duration if min/max duration is specified
-                if self.min_duration is not None or self.max_duration is not None:
-                    try:
-                        info = torchaudio.info(audio_path)
-                        duration = info.num_frames / info.sample_rate
-                        
-                        if self.min_duration is not None and duration < self.min_duration:
-                            if self.debug:
-                                # In debug mode, include short files
-                                print(f"Debug mode: Including short audio file: {audio_path} ({duration:.2f}s)")
-                            else:
-                                print(f"Warning: Audio file too short: {audio_path} ({duration:.2f}s)")
-                                continue
-                        
-                        if self.max_duration is not None and duration > self.max_duration:
-                            if self.debug:
-                                # In debug mode, include long files
-                                print(f"Debug mode: Including long audio file: {audio_path} ({duration:.2f}s)")
-                            else:
-                                print(f"Warning: Audio file too long: {audio_path} ({duration:.2f}s)")
-                                continue
-                    except Exception as e:
-                        if self.debug:
-                            # In debug mode, include files with errors
-                            print(f"Debug mode: Using dummy audio for file with error: {audio_path}: {e}")
-                            samples.append({
-                                "audio_path": audio_path,
-                                "text": text,
-                                "speaker_id": speaker_id_numeric,
-                                "missing_audio": True
-                            })
-                            continue
-                        else:
-                            print(f"Warning: Could not get duration for {audio_path}: {e}")
-                            continue
-                
-                samples.append({
-                    "audio_path": audio_path,
-                    "text": text,
-                    "speaker_id": speaker_id_numeric,
-                    "missing_audio": False
-                })
+        # Set strict duration limits
+        min_duration = max(1.0, self.min_duration) if self.min_duration is not None else 1.0
+        max_duration = min(10.0, self.max_duration) if self.max_duration is not None else 10.0
         
+        # Count total and filtered samples for debug
+        total_samples = 0
+        filtered_samples = 0
+        too_short = 0
+        too_long = 0
+        missing_files = 0
+        
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            
+        # Use tqdm in debug mode to show progress
+        line_iterator = tqdm(lines, desc="Loading manifest") if self.debug else lines
+            
+        for line in line_iterator:
+            line = line.strip()
+            if not line:
+                continue
+                
+            total_samples += 1
+            
+            parts = line.split("|")
+            if len(parts) != 3:
+                print(f"Warning: Skipping malformed line: {line}")
+                filtered_samples += 1
+                continue
+            
+            audio_path, text, speaker_id = parts
+            
+            # Convert speaker_id to a numeric value if it's not already numeric
+            if not speaker_id.isdigit():
+                if speaker_id not in speaker_to_id:
+                    # Assign a new numeric ID to this speaker
+                    speaker_to_id[speaker_id] = len(speaker_to_id)
+                speaker_id_numeric = speaker_to_id[speaker_id]
+            else:
+                speaker_id_numeric = int(speaker_id)
+            
+            # If audio_dir is provided, join with audio_path
+            if self.audio_dir is not None:
+                audio_path = os.path.join(self.audio_dir, audio_path)
+            
+            # Check if file exists
+            file_exists = os.path.exists(audio_path)
+            if not file_exists:
+                if self.debug:
+                    # In debug mode, include the file with a flag indicating it's missing
+                    print(f"Debug mode: Using dummy audio for missing file: {audio_path}")
+                    samples.append({
+                        "audio_path": audio_path,
+                        "text": text,
+                        "speaker_id": speaker_id_numeric,
+                        "missing_audio": True,
+                        "duration": 2.0,  # Default duration for dummy audio
+                    })
+                    continue
+                else:
+                    missing_files += 1
+                    filtered_samples += 1
+                    continue
+            
+            # Check duration - always check to ensure consistent batching
+            try:
+                info = torchaudio.info(audio_path)
+                duration = info.num_frames / info.sample_rate
+                
+                # Strictly enforce duration limits for more consistent batching
+                if duration < min_duration:
+                    too_short += 1
+                    filtered_samples += 1
+                    if self.debug:
+                        print(f"Debug mode: Skipping too short audio file: {audio_path} ({duration:.2f}s < {min_duration:.2f}s)")
+                    continue
+                
+                if duration > max_duration:
+                    too_long += 1
+                    filtered_samples += 1
+                    if self.debug:
+                        print(f"Debug mode: Skipping too long audio file: {audio_path} ({duration:.2f}s > {max_duration:.2f}s)")
+                    continue
+                
+            except Exception as e:
+                if self.debug:
+                    # In debug mode, include files with errors
+                    print(f"Debug mode: Using dummy audio for file with error: {audio_path}: {e}")
+                    samples.append({
+                        "audio_path": audio_path,
+                        "text": text,
+                        "speaker_id": speaker_id_numeric,
+                        "missing_audio": True,
+                        "duration": 2.0,  # Default duration for dummy audio
+                    })
+                    continue
+                else:
+                    filtered_samples += 1
+                    continue
+            
+            samples.append({
+                "audio_path": audio_path,
+                "text": text,
+                "speaker_id": speaker_id_numeric,
+                "missing_audio": False,
+                "duration": duration,  # Store duration for efficient length-based batching
+            })
+        
+        # Print summary of filtered samples
+        if filtered_samples > 0:
+            print(f"Filtered {filtered_samples}/{total_samples} samples "
+                  f"(too short: {too_short}, too long: {too_long}, missing: {missing_files})")
+            
         return samples
     
     def __len__(self) -> int:
@@ -233,7 +280,7 @@ class EstonianASRDataset(Dataset):
         return processed
 
 
-def collate_fn(batch, max_input_length=None, debug=False, processor=None):
+def collate_fn(batch, max_input_length=None, debug=False, processor=None, static_memory=True):
     """
     Collate function for the DataLoader.
     
@@ -242,10 +289,13 @@ def collate_fn(batch, max_input_length=None, debug=False, processor=None):
         max_input_length: Maximum input length to limit sequence length
         debug: Whether to print debug information
         processor: The processor to use for vocabulary size checking
+        static_memory: Whether to use static memory allocation for batch tensors
         
     Returns:
         Dictionary with batched tensors
     """
+    start_time = time.time() if debug else None
+    
     # Filter out samples with empty tensors
     valid_batch = []
     for sample in batch:
@@ -286,60 +336,136 @@ def collate_fn(batch, max_input_length=None, debug=False, processor=None):
             "speaker_id": torch.zeros(1, dtype=torch.long)
         }
     
+    # Measure filtering time
+    if debug and start_time:
+        filter_time = time.time() - start_time
+        start_shape_time = time.time()
+    
     # Get batch size and maximum lengths
     batch_size = len(valid_batch)
-    max_input_length_in_batch = max([sample["input_values"].shape[-1] for sample in valid_batch])
     
-    # Limit input length if specified
-    if max_input_length is not None and max_input_length > 0:
-        max_input_length_in_batch = min(max_input_length_in_batch, max_input_length)
-        if debug:
-            print(f"Limiting maximum sequence length to {max_input_length_in_batch}")
-    
-    max_label_length = max([sample["labels"].shape[0] for sample in valid_batch])
-    
-    # Initialize input tensors with zeros
-    input_values = torch.zeros(batch_size, max_input_length_in_batch)
-    attention_mask = torch.zeros(batch_size, max_input_length_in_batch)
-    
-    # Determine pad token - use a default of 0
-    pad_token = 0
-    
-    # Initialize labels with pad tokens
-    labels = torch.full((batch_size, max_label_length), pad_token, dtype=torch.long)
-    label_lengths = torch.zeros(batch_size, dtype=torch.long)
-    speaker_ids = torch.zeros(batch_size, dtype=torch.long)
-    
-    # Fill tensors efficiently
-    for i, sample in enumerate(valid_batch):
-        # Extract input values (make sure it's 2D)
-        # Handle potentially different shapes by getting the raw tensor
-        if sample["input_values"].dim() == 3:  # [1, 1, length]
-            sample_input = sample["input_values"].squeeze(0)
-        elif sample["input_values"].dim() == 2:  # [1, length]
-            sample_input = sample["input_values"]
-        else:  # Just in case
-            sample_input = sample["input_values"].view(1, -1)
+    # For static memory allocation (faster), we need to pre-determine dimensions
+    if static_memory:
+        # Pre-compute dimensions for allocation
+        max_input_lengths = [sample["input_values"].shape[-1] for sample in valid_batch]
+        max_input_length_in_batch = max(max_input_lengths)
+        
+        # Limit input length if specified
+        if max_input_length is not None and max_input_length > 0:
+            max_input_length_in_batch = min(max_input_length_in_batch, max_input_length)
+            if debug:
+                print(f"Limiting maximum sequence length to {max_input_length_in_batch}")
+                
+        # Pre-compute label dimensions
+        label_lengths = torch.tensor([sample["labels"].shape[0] for sample in valid_batch], dtype=torch.long)
+        max_label_length = label_lengths.max().item()
+        
+        # Initialize input tensors with zeros - use static allocation
+        input_values = torch.zeros(batch_size, 1, max_input_length_in_batch)
+        attention_mask = torch.zeros(batch_size, max_input_length_in_batch)
+        
+        # Determine pad token - use a default of 0
+        pad_token = 0
+        
+        # Initialize labels with pad tokens
+        labels = torch.full((batch_size, max_label_length), pad_token, dtype=torch.long)
+        speaker_ids = torch.zeros(batch_size, dtype=torch.long)
+        
+        # Fill tensors efficiently
+        for i, sample in enumerate(valid_batch):
+            # Extract input values (make sure it's 2D)
+            # Handle potentially different shapes by getting the raw tensor
+            input_tensor = sample["input_values"]
+            if input_tensor.dim() == 3:  # [1, 1, length]
+                input_tensor = input_tensor.squeeze(0)
+            elif input_tensor.dim() == 1:  # Convert [length] to [1, length]
+                input_tensor = input_tensor.unsqueeze(0)
+                
+            # Input values and attention mask
+            input_length = min(input_tensor.shape[1], max_input_length_in_batch)
+            input_values[i, 0, :input_length] = input_tensor[0, :input_length]
+            attention_mask[i, :input_length] = 1
             
-        # Input values and attention mask
-        input_length = min(sample_input.shape[1], max_input_length_in_batch)
-        input_values[i, :input_length] = sample_input[0, :input_length]
-        attention_mask[i, :input_length] = 1
+            # Labels - already have the label lengths from earlier computation
+            label_length = label_lengths[i].item()
+            labels[i, :label_length] = sample["labels"]
+            
+            # Speaker ID
+            speaker_ids[i] = sample["speaker_id"]
+    else:
+        # Dynamic memory allocation (slower but more flexible)
+        max_input_length_in_batch = max([sample["input_values"].shape[-1] for sample in valid_batch])
         
-        # Labels
-        label_length = sample["labels"].shape[0]
-        label_lengths[i] = label_length
-        labels[i, :label_length] = sample["labels"]
+        # Limit input length if specified
+        if max_input_length is not None and max_input_length > 0:
+            max_input_length_in_batch = min(max_input_length_in_batch, max_input_length)
+            if debug:
+                print(f"Limiting maximum sequence length to {max_input_length_in_batch}")
         
-        # Speaker ID
-        speaker_ids[i] = sample["speaker_id"]
+        max_label_length = max([sample["labels"].shape[0] for sample in valid_batch])
+        
+        # Initialize input tensors with zeros
+        input_values = torch.zeros(batch_size, max_input_length_in_batch)
+        attention_mask = torch.zeros(batch_size, max_input_length_in_batch)
+        
+        # Determine pad token - use a default of 0
+        pad_token = 0
+        
+        # Initialize labels with pad tokens
+        labels = torch.full((batch_size, max_label_length), pad_token, dtype=torch.long)
+        label_lengths = torch.zeros(batch_size, dtype=torch.long)
+        speaker_ids = torch.zeros(batch_size, dtype=torch.long)
+        
+        # Fill tensors efficiently
+        for i, sample in enumerate(valid_batch):
+            # Extract input values (make sure it's 2D)
+            # Handle potentially different shapes by getting the raw tensor
+            if sample["input_values"].dim() == 3:  # [1, 1, length]
+                sample_input = sample["input_values"].squeeze(0)
+            elif sample["input_values"].dim() == 2:  # [1, length]
+                sample_input = sample["input_values"]
+            else:  # Just in case
+                sample_input = sample["input_values"].view(1, -1)
+                
+            # Input values and attention mask
+            input_length = min(sample_input.shape[1], max_input_length_in_batch)
+            input_values[i, :input_length] = sample_input[0, :input_length]
+            attention_mask[i, :input_length] = 1
+            
+            # Labels
+            label_length = sample["labels"].shape[0]
+            label_lengths[i] = label_length
+            labels[i, :label_length] = sample["labels"]
+            
+            # Speaker ID
+            speaker_ids[i] = sample["speaker_id"]
+        
+        # Add channel dimension - XLSR expects [batch_size, 1, sequence_length]
+        input_values = input_values.unsqueeze(1)
     
-    # Add channel dimension - XLSR expects [batch_size, 1, sequence_length]
-    input_values = input_values.unsqueeze(1)
-    
-    # Debug information for batch shapes
-    if debug:
+    # Measure tensor construction time
+    if debug and start_time:
+        shape_time = time.time() - start_shape_time
+        total_time = time.time() - start_time
+        
+        # Calculate tensor sizes for memory usage tracking
+        input_size_mb = input_values.element_size() * input_values.nelement() / (1024 * 1024)
+        labels_size_mb = labels.element_size() * labels.nelement() / (1024 * 1024)
+        total_size_mb = input_size_mb + labels_size_mb
+        
+        print(f"DEBUG - Batch collation timing: filter={filter_time:.4f}s, shape={shape_time:.4f}s, total={total_time:.4f}s")
+        print(f"DEBUG - Batch memory: input={input_size_mb:.2f}MB, labels={labels_size_mb:.2f}MB, total={total_size_mb:.2f}MB")
         print(f"DEBUG - Batch shapes: input={input_values.shape}, attn={attention_mask.shape}, labels={labels.shape}, lengths={label_lengths.shape}")
+    
+    # More debug info for label lengths
+    if debug:
+        if label_lengths.numel() > 0:
+            min_len = label_lengths.min().item()
+            max_len = label_lengths.max().item()
+            avg_len = label_lengths.float().mean().item()
+            print(f"After fixing: Label lengths min: {min_len}, max: {max_len}, avg: {avg_len:.1f}")
+            print(f"DEBUG: label_lengths min: {min_len}, max: {max_len}, shape: {label_lengths.shape}")
+            print(f"DEBUG: labels shape: {labels.shape}")
     
     return {
         "input_values": input_values,
@@ -406,6 +532,7 @@ class LengthBatchSampler(torch.utils.data.Sampler):
         drop_last: Whether to drop the last incomplete batch
         sort_key: Function to extract the length from a sample
         bucket_size_multiplier: Multiplier for bucket size (larger values = more randomness)
+        use_log_buckets: Whether to use logarithmic bucketing for better grouping
     """
     
     def __init__(
@@ -415,13 +542,15 @@ class LengthBatchSampler(torch.utils.data.Sampler):
         shuffle: bool = True,
         drop_last: bool = False,
         sort_key: Optional[Callable] = None,
-        bucket_size_multiplier: int = 5
+        bucket_size_multiplier: int = 5,
+        use_log_buckets: bool = True
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
         self.bucket_size_multiplier = bucket_size_multiplier
+        self.use_log_buckets = use_log_buckets
         
         # Default sort key extracts audio path and estimates length
         if sort_key is None:
@@ -440,10 +569,14 @@ class LengthBatchSampler(torch.utils.data.Sampler):
         if audio_path in self.lengths:
             return self.lengths[audio_path]
         
+        # Use pre-computed duration if available
+        if "duration" in sample:
+            # Convert to samples for sorting
+            length = int(sample["duration"] * 16000)
         # Check if the audio file is missing
-        if sample.get("missing_audio", False):
+        elif sample.get("missing_audio", False):
             # Use a default length for missing files
-            length = 16000 * 1  # Default to 1 second for missing files
+            length = 16000 * 2  # Default to 2 seconds for missing files
         else:
             try:
                 # Try to get actual audio length
@@ -460,11 +593,28 @@ class LengthBatchSampler(torch.utils.data.Sampler):
         # Get indices and their corresponding lengths
         indices = list(range(len(self.dataset)))
         
-        # Sort indices by length
-        try:
-            indices.sort(key=self.sort_key)
-        except Exception as e:
-            print(f"Warning: Error sorting by length: {e}. Using unsorted indices.")
+        # Get lengths for all indices
+        lengths = [self.sort_key(idx) for idx in indices]
+        
+        # Apply logarithmic bucketing for better grouping if enabled
+        if self.use_log_buckets:
+            # Apply log transformation to smoothly group similar lengths
+            # Use log base 1.1 to create more fine-grained buckets
+            min_length = max(1, min(lengths))  # Avoid log(0)
+            bucket_fn = lambda l: int(np.log(max(l, min_length) / min_length) / np.log(1.1))
+            bucket_indices = [(bucket_fn(lengths[i]), i) for i in range(len(indices))]
+            
+            # Sort by bucket first, then by actual length within bucket
+            bucket_indices.sort()
+            
+            # Extract sorted indices
+            indices = [idx for _, idx in bucket_indices]
+        else:
+            # Sort indices by length directly
+            try:
+                indices.sort(key=self.sort_key)
+            except Exception as e:
+                print(f"Warning: Error sorting by length: {e}. Using unsorted indices.")
         
         # Create buckets of size batch_size * bucket_size_multiplier
         bucket_size = self.batch_size * self.bucket_size_multiplier
@@ -515,7 +665,9 @@ def create_length_sorted_dataloader(
     shuffle: bool = True,
     drop_last: bool = False,
     bucket_size_multiplier: int = 5,
-    debug: bool = False
+    debug: bool = False,
+    use_log_buckets: bool = True,
+    pin_memory: bool = True
 ) -> DataLoader:
     """
     Create a DataLoader with length-based batch sampling for the Estonian ASR dataset.
@@ -533,11 +685,16 @@ def create_length_sorted_dataloader(
         drop_last: Whether to drop the last incomplete batch
         bucket_size_multiplier: Multiplier for bucket size (larger values = more randomness)
         debug: Whether to run in debug mode (include missing files with dummy audio)
+        use_log_buckets: Whether to use logarithmic bucketing for better length grouping
+        pin_memory: Whether to use pin_memory for faster GPU transfers
         
     Returns:
         DataLoader for the dataset with length-based batch sampling
     """
     import random
+    
+    if debug:
+        print(f"Creating length-sorted dataloader with min_duration={min_duration}s, max_duration={max_duration}s")
     
     dataset = EstonianASRDataset(
         manifest_path=manifest_path,
@@ -554,7 +711,8 @@ def create_length_sorted_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
-        bucket_size_multiplier=bucket_size_multiplier
+        bucket_size_multiplier=bucket_size_multiplier,
+        use_log_buckets=use_log_buckets
     )
     
     # Create a collate function wrapper that passes the processor
@@ -562,13 +720,19 @@ def create_length_sorted_dataloader(
         batch, 
         max_input_length=int(max_duration * processor.audio_preprocessor.sample_rate) if max_duration else None,
         debug=debug,
-        processor=processor
+        processor=processor,
+        static_memory=True
     )
+    
+    # Report dataloader settings in debug mode
+    if debug:
+        print(f"DataLoader settings: batch_size={batch_size}, num_workers={num_workers}, "
+              f"shuffle={shuffle}, drop_last={drop_last}, bucket_size_multiplier={bucket_size_multiplier}")
     
     return DataLoader(
         dataset=dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn_with_processor,
-        pin_memory=True
+        pin_memory=pin_memory
     ) 

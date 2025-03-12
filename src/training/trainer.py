@@ -130,6 +130,30 @@ class XLSRTransducerTrainer:
         self.device = torch.device(self.args.device)
         self.model = self.model.to(self.device)
         
+        # Try to use torch.compile if available (PyTorch 2.0+)
+        try:
+            import torch._dynamo
+            compile_supported = hasattr(torch, 'compile')
+            if compile_supported:
+                # Check if we're on a supported device
+                use_compile = (
+                    self.device.type == "cuda" or  # NVIDIA GPUs 
+                    self.device.type == "mps"      # Apple Silicon GPUs
+                )
+                
+                if use_compile:
+                    self.logger.info("Using torch.compile for optimized model execution")
+                    # Use the most appropriate backend based on the device
+                    backend = "inductor" if self.device.type == "cuda" else "eager"
+                    self.model = torch.compile(self.model, backend=backend)
+                    
+                    # Set config to avoid recompilations
+                    torch._dynamo.config.suppress_errors = True
+                    torch._dynamo.config.cache_size_limit = 512
+        except (ImportError, AttributeError):
+            # torch.compile not available, continue without it
+            self.logger.info("torch.compile not available, using standard model execution")
+        
         # Set up loss function
         self.loss_fn = TransducerLossWrapper(blank_id=model.blank_id)
         
@@ -852,6 +876,17 @@ class Trainer:
             max_input_length = int(max_duration * self.processor.audio_preprocessor.sample_rate)
             self.logger.info(f"Limiting maximum sequence length to {max_input_length} samples ({max_duration}s)")
         
+        # Get dataset optimization settings
+        dataset_config = data_config.get("dataset", {})
+        bucket_size_multiplier = dataset_config.get("bucket_size_multiplier", 5)
+        use_log_buckets = dataset_config.get("use_log_buckets", True)
+        drop_last = dataset_config.get("drop_last", False)
+        pin_memory = dataset_config.get("pin_memory", True)
+        
+        if not debug:
+            self.logger.info(f"Using optimized dataset with bucketing: bucket_size_multiplier={bucket_size_multiplier}, "
+                            f"use_log_buckets={use_log_buckets}, drop_last={drop_last}")
+        
         # Use length-sorted dataloader for more efficient training
         train_dataloader = create_length_sorted_dataloader(
             manifest_path=data_config.get("train_manifest", ""),
@@ -862,7 +897,10 @@ class Trainer:
             audio_dir=data_config.get("audio_dir", ""),
             num_workers=num_workers,
             shuffle=True,
-            bucket_size_multiplier=5,  # Adjust this for more/less randomness
+            drop_last=drop_last,
+            bucket_size_multiplier=bucket_size_multiplier,
+            use_log_buckets=use_log_buckets,
+            pin_memory=pin_memory,
             debug=debug
         )
         
@@ -875,7 +913,10 @@ class Trainer:
             audio_dir=data_config.get("audio_dir", ""),
             num_workers=num_workers,
             shuffle=False,  # No need to shuffle evaluation data
+            drop_last=False,  # Don't drop last batch for evaluation
             bucket_size_multiplier=1,  # No randomness for evaluation
+            use_log_buckets=False,  # No need for log buckets in evaluation
+            pin_memory=pin_memory,
             debug=debug
         )
         

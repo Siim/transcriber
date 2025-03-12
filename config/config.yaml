@@ -7,10 +7,16 @@ data:
   test_manifest: "data/test_list.txt"
   audio_dir: ""
   sample_rate: 16000
-  max_duration: 10.0  # Reduced from 30.0 to limit sequence lengths
-  min_duration: 0.5
-  batch_size: 24
+  max_duration: 10.0  # Maximum audio duration for consistency
+  min_duration: 1.0   # Minimum audio duration for efficiency
+  batch_size: 32      # Larger batch size for better GPU utilization
   num_workers: 8
+  # Optimized dataset settings for faster training
+  dataset:
+    bucket_size_multiplier: 5  # Controls randomness in bucketing
+    use_log_buckets: true      # Use logarithmic bucketing for better grouping
+    drop_last: false           # Whether to drop incomplete batches
+    pin_memory: true           # Enable pin_memory for faster data transfer to GPU
 
 # Model configuration
 model:
