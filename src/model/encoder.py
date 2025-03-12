@@ -562,7 +562,15 @@ class XLSREncoder(nn.Module):
             if self.training and layer.dropout.p > 0:
                 # Apply layerdrop if training
                 dropout_probability = torch.rand(())
-                if dropout_probability > self.model.encoder.layerdrop:
+                # Get layerdrop probability - handle different encoder implementations
+                layerdrop_prob = 0.0
+                if hasattr(self.model.encoder, "layerdrop"):
+                    layerdrop_prob = self.model.encoder.layerdrop
+                else:
+                    # Fallback to the config value we set earlier
+                    layerdrop_prob = self.model.config.layerdrop if hasattr(self.model.config, "layerdrop") else 0.0
+                
+                if dropout_probability > layerdrop_prob:
                     hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
             else:
                 hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
