@@ -233,7 +233,7 @@ class EstonianASRDataset(Dataset):
         return processed
 
 
-def collate_fn(batch, max_input_length=None, debug=False):
+def collate_fn(batch, max_input_length=None, debug=False, processor=None):
     """
     Collate function for the DataLoader.
     
@@ -241,6 +241,7 @@ def collate_fn(batch, max_input_length=None, debug=False):
         batch: List of samples from the dataset
         max_input_length: Maximum input length to limit sequence length
         debug: Whether to print debug information
+        processor: The processor to use for vocabulary size checking
         
     Returns:
         Dictionary with batched tensors
@@ -258,11 +259,16 @@ def collate_fn(batch, max_input_length=None, debug=False):
             if torch.max(sample["labels"]) >= sample["processor"].tokenizer.vocab_size:
                 print(f"WARNING: Label exceeds vocabulary size: {torch.max(sample['labels']).item()} >= {sample['processor'].tokenizer.vocab_size}")
                 continue
+        elif "labels" in sample and processor is not None:
+            # Use provided processor for vocabulary size check
+            if torch.max(sample["labels"]) >= processor.vocab_size:
+                print(f"WARNING: Label exceeds provided processor vocabulary size: {torch.max(sample['labels']).item()} >= {processor.vocab_size}")
+                continue
         elif "labels" in sample:
             # If processor is not in the sample, we can't check the vocab size
-            # Just make sure the labels are not too large (use a reasonable default)
-            if torch.max(sample["labels"]) >= 100:  # Use a reasonable default vocab size
-                print(f"WARNING: Label exceeds reasonable vocabulary size: {torch.max(sample['labels']).item()} >= 100")
+            # Just make sure the labels are not too large - use 1000 which matches our BPE config
+            if torch.max(sample["labels"]) >= 1000:  # Match BPE vocab size from config
+                print(f"WARNING: Label exceeds BPE vocabulary size: {torch.max(sample['labels']).item()} >= 1000")
                 continue
             
         valid_batch.append(sample)
@@ -270,6 +276,8 @@ def collate_fn(batch, max_input_length=None, debug=False):
     # If all samples are invalid, create a dummy batch
     if len(valid_batch) == 0:
         print("WARNING: All samples in batch are invalid, creating dummy batch")
+        if debug:
+            print("DEBUG: Creating dummy batch with label_lengths min: 1, max: 1")
         return {
             "input_values": torch.zeros(1, 1, 1000),
             "attention_mask": torch.zeros(1, 1000),
@@ -549,10 +557,18 @@ def create_length_sorted_dataloader(
         bucket_size_multiplier=bucket_size_multiplier
     )
     
+    # Create a collate function wrapper that passes the processor
+    collate_fn_with_processor = lambda batch: collate_fn(
+        batch, 
+        max_input_length=int(max_duration * processor.audio_preprocessor.sample_rate) if max_duration else None,
+        debug=debug,
+        processor=processor
+    )
+    
     return DataLoader(
         dataset=dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_with_processor,
         pin_memory=True
     ) 
