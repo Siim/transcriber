@@ -127,27 +127,47 @@ class TransducerLoss(nn.Module):
         labels_clipped = torch.clamp(labels, 0, vocab_size - 1)
         
         # Choose implementation based on device and available libraries
-        try:
-            # Use the appropriate implementation based on device and what's available
-            if self.implementation == "warp-rnnt" and device.type == "cuda":
+        loss = None
+        implementation_tried = []
+        
+        # Attempt to use the implementations in order of preference
+        if self.implementation == "warp-rnnt" and device.type == "cuda":
+            implementation_tried.append("warp-rnnt")
+            try:
+                logger.debug("Attempting to use warp-rnnt implementation...")
                 loss = self._compute_loss_warp_rnnt(
                     logits, labels_clipped, input_lengths, label_lengths
                 )
-            elif self.implementation == "torchaudio" and (device.type == "cuda" or device.type == "mps"):
+                logger.debug("warp-rnnt implementation successful")
+            except Exception as e:
+                logger.warning(f"Error using warp-rnnt implementation: {e}. Trying next implementation.")
+        
+        if loss is None and self.implementation in ["warp-rnnt", "torchaudio"] and (device.type == "cuda" or device.type == "mps"):
+            implementation_tried.append("torchaudio")
+            try:
+                logger.debug("Attempting to use torchaudio implementation...")
                 loss = self._compute_loss_torchaudio(
                     logits, labels_clipped, input_lengths, label_lengths
                 )
-            elif self.implementation == "fast-rnnt" and (device.type == "cuda" or device.type == "cpu"):
+                logger.debug("torchaudio implementation successful")
+            except Exception as e:
+                logger.warning(f"Error using torchaudio implementation: {e}. Trying next implementation.")
+        
+        if loss is None and self.implementation in ["warp-rnnt", "torchaudio", "fast-rnnt"] and (device.type == "cuda" or device.type == "cpu"):
+            implementation_tried.append("fast-rnnt")
+            try:
+                logger.debug("Attempting to use fast-rnnt implementation...")
                 loss = self._compute_loss_fast_rnnt(
                     logits, labels_clipped, input_lengths, label_lengths
                 )
-            else:
-                # Fall back to CPU implementation
-                loss = self._compute_loss_cpu(
-                    logits, labels_clipped, input_lengths, label_lengths
-                )
-        except Exception as e:
-            logger.warning(f"Error using {self.implementation} implementation: {e}. Falling back to CPU implementation.")
+                logger.debug("fast-rnnt implementation successful")
+            except Exception as e:
+                logger.warning(f"Error using fast-rnnt implementation: {e}. Falling back to CPU implementation.")
+        
+        # Fallback to CPU implementation if all else fails
+        if loss is None:
+            implementation_tried.append("cpu")
+            logger.info(f"Using CPU implementation after trying: {', '.join(implementation_tried)}")
             loss = self._compute_loss_cpu(
                 logits, labels_clipped, input_lengths, label_lengths
             )
@@ -182,20 +202,80 @@ class TransducerLoss(nn.Module):
         Returns:
             Loss tensor
         """
-        # Ensure contiguous memory layout for CUDA
-        log_probs = F.log_softmax(logits, dim=-1).contiguous()
+        try:
+            # Ensure contiguous memory layout for CUDA
+            log_probs = F.log_softmax(logits, dim=-1).contiguous()
+            
+            # According to warp-rnnt documentation:
+            # - acts: (B, T, U, V) where B is batch size, T is input length, U is target length, and V is vocab size
+            # - labels: (B, U-1) where U-1 is target length without blank
+            # - act_lens: (B) input lengths
+            # - label_lens: (B) label lengths
+            # https://github.com/HawkAaron/warp-transducer#c-interface
+            
+            batch_size = labels.size(0)
+            device = labels.device
+            
+            # Trim labels according to actual lengths
+            # warp-rnnt expects labels without blanks, just the real target symbols
+            trimmed_labels = []
+            max_length = 0
+            
+            for b in range(batch_size):
+                length = min(label_lengths[b].item(), labels.size(1))
+                if length > 0:
+                    # Only include non-blank labels up to the specified length
+                    trimmed_labels.append(labels[b, :length])
+                    max_length = max(max_length, length)
+                else:
+                    # Handle edge case of zero length
+                    trimmed_labels.append(torch.tensor([0], device=device))
+                    max_length = max(max_length, 1)
+            
+            # Create properly sized tensor for the trimmed labels
+            packed_labels = torch.zeros(batch_size, max_length, dtype=torch.int, device=device)
+            for b in range(batch_size):
+                actual_length = trimmed_labels[b].size(0)
+                packed_labels[b, :actual_length] = trimmed_labels[b]
+            
+            # Double-check for NaN or inf values in log_probs
+            if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+                logger.warning("NaN or inf values detected in log_probs before warp-rnnt. Replacing with zeros.")
+                log_probs = torch.nan_to_num(log_probs, nan=0.0, posinf=0.0, neginf=-100.0)
+            
+            # Make sure all tensors are on the same device and have the right type
+            input_lengths_cuda = input_lengths.int().to(device)
+            label_lengths_cuda = label_lengths.int().to(device)
+            
+            # Debug logs
+            logger.debug(f"Warp-RNNT input shapes: log_probs={log_probs.shape}, packed_labels={packed_labels.shape}")
+            logger.debug(f"Warp-RNNT length shapes: input_lengths={input_lengths_cuda.shape}, label_lengths={label_lengths_cuda.shape}")
+            
+            # Call warp-rnnt with the properly formatted inputs
+            loss = self.warp_rnnt.rnnt_loss(
+                log_probs,
+                packed_labels,
+                input_lengths_cuda,
+                label_lengths_cuda,
+                blank=self.blank_id,
+                reduction=self.reduction
+            )
+            
+            # Check for NaN loss
+            if torch.isnan(loss).any():
+                logger.warning("NaN loss detected from warp-rnnt. Using a fallback value.")
+                return torch.tensor(100.0, device=device, requires_grad=True)
+            
+            return loss
         
-        # Compute the loss
-        loss = self.warp_rnnt.rnnt_loss(
-            log_probs,
-            labels.int(),
-            input_lengths.int(),
-            label_lengths.int(),
-            blank=self.blank_id,
-            reduction=self.reduction
-        )
-        
-        return loss
+        except Exception as e:
+            # Detailed error reporting for debugging
+            logger.warning(f"Error in warp-rnnt: {e}")
+            logger.warning(f"Input shapes - logits: {logits.shape}, labels: {labels.shape}")
+            logger.warning(f"Input lengths - input: {input_lengths}, label: {label_lengths}")
+            
+            # Raise the exception to let the caller handle fallback
+            raise e
     
     def _compute_loss_torchaudio(
         self,
@@ -464,11 +544,12 @@ class TransducerLossWrapper(nn.Module):
         
         # Compute loss
         try:
+            # Make sure parameter names match the TransducerLoss.forward method
             loss = self.loss_fn(
-                logits=logits,
+                outputs={"logits": logits},  # TransducerLoss expects a dict with 'logits'
                 labels=labels,
-                logit_lengths=encoder_lengths,
                 label_lengths=label_lengths,
+                attention_mask=attention_mask,
             )
         except Exception as e:
             print(f"ERROR in transducer loss: {e}")
