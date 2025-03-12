@@ -327,15 +327,22 @@ class XLSREncoder(nn.Module):
         config.activation_dropout = dropout
         config.layerdrop = layerdrop
         
+        # Explicitly set model to training mode (important for feature extractor)
+        self.model.train()
+        
         # Freeze feature encoder if specified
         if freeze_feature_encoder:
             for param in self.model.feature_extractor.parameters():
                 param.requires_grad = False
+            # Even when freezing, need to ensure training mode for batch norm stats
+            self.model.feature_extractor.eval()
         
         # Freeze base model if specified
         if freeze_base_model:
             for param in self.model.parameters():
                 param.requires_grad = False
+            # Still enable dropout even when freezing
+            self.model.train()
         
         # Replace encoder layers with streaming encoder layers if using streaming
         if attention_mask_type != "full":

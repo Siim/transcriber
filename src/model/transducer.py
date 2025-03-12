@@ -79,6 +79,12 @@ class XLSRTransducer(nn.Module):
                 - logits: Output tensor of shape (batch_size, time_steps, label_length, vocab_size)
                 - encoder_outputs: Encoder outputs of shape (batch_size, time_steps, encoder_dim)
         """
+        # Ensure training mode is set correctly
+        if self.training:
+            self.encoder.train()
+            self.predictor.train()
+            self.joint.train()
+        
         # Encoder forward pass
         encoder_outputs = self.encoder(
             input_values=input_values,
@@ -110,14 +116,16 @@ class XLSRTransducer(nn.Module):
                 encoder_outputs=encoder_hidden_states,
                 predictor_outputs=predictor_hidden_states,
             )
+            
+            return {
+                "logits": logits,
+                "encoder_outputs": encoder_hidden_states,
+            }
         else:
-            # For inference, we don't need to compute joint outputs
-            logits = None
-        
-        return {
-            "logits": logits,
-            "encoder_outputs": encoder_hidden_states,
-        }
+            # For inference
+            return {
+                "encoder_outputs": encoder_hidden_states,
+            }
     
     def decode_greedy(
         self,
