@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 from model.transducer import XLSRTransducer
 from training.loss import TransducerLossWrapper
-from data.dataset import EstonianASRDataset, collate_fn
+from data.dataset import EstonianASRDataset, collate_fn, create_length_sorted_dataloader
 from data.processor import XLSRTransducerProcessor
 
 
@@ -92,6 +92,7 @@ class TrainingArguments:
     scheduler: str = "linear"  # Options: "linear", "cosine", "constant"
     use_fp16: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    gradient_accumulation_steps: int = 1  # Number of steps to accumulate gradients
 
 
 class XLSRTransducerTrainer:
@@ -264,6 +265,24 @@ class XLSRTransducerTrainer:
         num_batches = len(self.train_dataloader)
         start_time = time.time()
         
+        # Get gradient accumulation steps from config
+        gradient_accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
+        if gradient_accumulation_steps > 1:
+            self.logger.info(f"Using gradient accumulation with {gradient_accumulation_steps} steps")
+            
+            # Get batch size - handle case where we're using a batch_sampler
+            if hasattr(self.train_dataloader, 'batch_size') and self.train_dataloader.batch_size is not None:
+                batch_size = self.train_dataloader.batch_size
+            elif hasattr(self.train_dataloader, 'batch_sampler') and hasattr(self.train_dataloader.batch_sampler, 'batch_size'):
+                batch_size = self.train_dataloader.batch_sampler.batch_size
+            else:
+                # Default to a reasonable value if we can't determine it
+                batch_size = 2
+                self.logger.warning(f"Could not determine batch size, using default: {batch_size}")
+                
+            effective_batch_size = batch_size * gradient_accumulation_steps
+            self.logger.info(f"Effective batch size: {effective_batch_size}")
+        
         # Progress bar
         progress_bar = tqdm(
             total=num_batches,
@@ -280,6 +299,9 @@ class XLSRTransducerTrainer:
             torch.cuda.reset_peak_memory_stats()
             start_memory = torch.cuda.memory_allocated() / (1024 ** 3)
             self.logger.info(f"Initial GPU memory usage: {start_memory:.2f}GB")
+        
+        # Zero gradients at the beginning of the epoch
+        self.optimizer.zero_grad()
         
         # Training loop
         for batch_idx, batch in enumerate(self.train_dataloader):
@@ -306,6 +328,10 @@ class XLSRTransducerTrainer:
                         attention_mask=batch["attention_mask"],
                     )
                     
+                    # Scale loss for gradient accumulation
+                    if gradient_accumulation_steps > 1:
+                        loss = loss / gradient_accumulation_steps
+                    
                     # Check if loss requires gradient
                     if batch_idx == 0:
                         print(f"Loss requires_grad: {loss.requires_grad}")
@@ -319,32 +345,37 @@ class XLSRTransducerTrainer:
                     continue
                 
                 # Backward pass with gradient scaling
-                self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
                 
-                # Check for NaN gradients
-                has_nan_grad = False
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
-                        has_nan_grad = True
-                        break
-                
-                if has_nan_grad:
-                    self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
-                    # Skip parameter update for this batch
-                    continue
-                
-                # Gradient clipping
-                if self.args.grad_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.args.grad_clip
-                    )
-                
-                # Update weights
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # Only update weights after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
+                    # Check for NaN gradients
+                    has_nan_grad = False
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
+                            has_nan_grad = True
+                            break
+                    
+                    if has_nan_grad:
+                        self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
+                        # Skip parameter update for this batch
+                        self.optimizer.zero_grad()
+                        continue
+                    
+                    # Gradient clipping
+                    if self.args.grad_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.args.grad_clip
+                        )
+                    
+                    # Update weights
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    
+                    # Zero gradients
+                    self.optimizer.zero_grad()
             else:
                 # Forward pass
                 outputs = self.model(
@@ -361,6 +392,10 @@ class XLSRTransducerTrainer:
                     attention_mask=batch["attention_mask"],
                 )
                 
+                # Scale loss for gradient accumulation
+                if gradient_accumulation_steps > 1:
+                    loss = loss / gradient_accumulation_steps
+                
                 # Check for NaN loss
                 if torch.isnan(loss).any():
                     self.logger.warning(f"NaN loss detected at step {self.global_step}. Skipping batch.")
@@ -368,30 +403,35 @@ class XLSRTransducerTrainer:
                     continue
                 
                 # Backward pass
-                self.optimizer.zero_grad()
                 loss.backward()
                 
-                # Check for NaN gradients
-                has_nan_grad = False
-                for name, param in self.model.named_parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
-                        has_nan_grad = True
-                        break
-                
-                if has_nan_grad:
-                    self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
-                    # Skip parameter update for this batch
-                    continue
-                
-                # Gradient clipping
-                if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.args.grad_clip
-                    )
-                
-                # Update weights
-                self.optimizer.step()
+                # Only update weights after accumulating gradients
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
+                    # Check for NaN gradients
+                    has_nan_grad = False
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
+                            has_nan_grad = True
+                            break
+                    
+                    if has_nan_grad:
+                        self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
+                        # Skip parameter update for this batch
+                        self.optimizer.zero_grad()
+                        continue
+                    
+                    # Gradient clipping
+                    if self.args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.args.grad_clip
+                        )
+                    
+                    # Update weights
+                    self.optimizer.step()
+                    
+                    # Zero gradients
+                    self.optimizer.zero_grad()
             
             # Check for NaN parameters after update
             has_nan_param = False
@@ -812,22 +852,31 @@ class Trainer:
             max_input_length = int(max_duration * self.processor.audio_preprocessor.sample_rate)
             self.logger.info(f"Limiting maximum sequence length to {max_input_length} samples ({max_duration}s)")
         
-        train_dataloader = DataLoader(
-            self.train_dataset,
+        # Use length-sorted dataloader for more efficient training
+        train_dataloader = create_length_sorted_dataloader(
+            manifest_path=data_config.get("train_manifest", ""),
+            processor=self.processor,
             batch_size=batch_size,
-            shuffle=True,
+            max_duration=data_config.get("max_duration", 30.0),
+            min_duration=data_config.get("min_duration", 0.5),
+            audio_dir=data_config.get("audio_dir", ""),
             num_workers=num_workers,
-            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger, max_input_length),
-            pin_memory=(num_workers > 0)  # Only use pin_memory with workers
+            shuffle=True,
+            bucket_size_multiplier=5,  # Adjust this for more/less randomness
+            debug=debug
         )
         
-        eval_dataloader = DataLoader(
-            self.eval_dataset,
+        eval_dataloader = create_length_sorted_dataloader(
+            manifest_path=data_config.get("valid_manifest", ""),
+            processor=self.processor,
             batch_size=batch_size,
-            shuffle=False,
+            max_duration=data_config.get("max_duration", 30.0),
+            min_duration=data_config.get("min_duration", 0.5),
+            audio_dir=data_config.get("audio_dir", ""),
             num_workers=num_workers,
-            collate_fn=lambda batch: robust_collate_fn(batch, self.processor, self.logger, max_input_length),
-            pin_memory=(num_workers > 0)  # Only use pin_memory with workers
+            shuffle=False,  # No need to shuffle evaluation data
+            bucket_size_multiplier=1,  # No randomness for evaluation
+            debug=debug
         )
         
         # Create training arguments
@@ -848,17 +897,18 @@ class Trainer:
             output_dir=training_config.get("checkpoint_dir", "checkpoints"),
             log_dir=training_config.get("log_dir", "logs"),
             num_epochs=training_config.get("epochs", 10),
-            learning_rate=training_config.get("learning_rate", 1e-5),
-            weight_decay=training_config.get("weight_decay", 1e-6),
-            warmup_steps=training_config.get("warmup_steps", 5000),
-            grad_clip=training_config.get("grad_clip", 0.5),
+            learning_rate=training_config.get("learning_rate", 1e-4),
+            weight_decay=training_config.get("weight_decay", 1e-4),
+            warmup_steps=training_config.get("warmup_steps", 1000),
+            grad_clip=training_config.get("grad_clip", 5.0),
             log_interval=log_interval,
             eval_interval=eval_interval,
             save_interval=save_interval,
             early_stopping_patience=training_config.get("early_stopping_patience", 5),
-            scheduler=training_config.get("scheduler", "constant"),
+            scheduler=training_config.get("scheduler", "linear"),
             use_fp16=training_config.get("use_fp16", False),
-            device=device
+            device=device,
+            gradient_accumulation_steps=training_config.get("gradient_accumulation_steps", 1)
         )
         
         # Create the actual trainer

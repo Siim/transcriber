@@ -2,9 +2,10 @@ import os
 import torch
 import torchaudio
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 from torch.utils.data import Dataset, DataLoader
 from .processor import XLSRTransducerProcessor
+import random
 
 
 class EstonianASRDataset(Dataset):
@@ -252,9 +253,17 @@ def collate_fn(batch, max_input_length=None, debug=False):
             continue
             
         # Skip samples with labels that exceed vocabulary size
-        if torch.max(sample["labels"]) >= sample["processor"].tokenizer.vocab_size:
-            print(f"WARNING: Label exceeds vocabulary size: {torch.max(sample['labels']).item()} >= {sample['processor'].tokenizer.vocab_size}")
-            continue
+        # Check if processor key exists in the sample
+        if "processor" in sample and "labels" in sample:
+            if torch.max(sample["labels"]) >= sample["processor"].tokenizer.vocab_size:
+                print(f"WARNING: Label exceeds vocabulary size: {torch.max(sample['labels']).item()} >= {sample['processor'].tokenizer.vocab_size}")
+                continue
+        elif "labels" in sample:
+            # If processor is not in the sample, we can't check the vocab size
+            # Just make sure the labels are not too large (use a reasonable default)
+            if torch.max(sample["labels"]) >= 100:  # Use a reasonable default vocab size
+                print(f"WARNING: Label exceeds reasonable vocabulary size: {torch.max(sample['labels']).item()} >= 100")
+                continue
             
         valid_batch.append(sample)
     
@@ -371,6 +380,178 @@ def create_dataloader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+
+
+class LengthBatchSampler(torch.utils.data.Sampler):
+    """
+    Batch sampler that groups samples of similar lengths together.
+    This reduces padding and improves training efficiency.
+    
+    Args:
+        dataset: Dataset to sample from
+        batch_size: Batch size
+        shuffle: Whether to shuffle the dataset
+        drop_last: Whether to drop the last incomplete batch
+        sort_key: Function to extract the length from a sample
+        bucket_size_multiplier: Multiplier for bucket size (larger values = more randomness)
+    """
+    
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        batch_size: int,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        sort_key: Optional[Callable] = None,
+        bucket_size_multiplier: int = 5
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.bucket_size_multiplier = bucket_size_multiplier
+        
+        # Default sort key extracts audio path and estimates length
+        if sort_key is None:
+            self.sort_key = lambda idx: self._get_audio_length(idx)
+        else:
+            self.sort_key = sort_key
+            
+        # Cache audio lengths to avoid recomputing
+        self.lengths = {}
+        
+    def _get_audio_length(self, idx: int) -> int:
+        """Get the length of an audio file in samples."""
+        sample = self.dataset.samples[idx]
+        audio_path = sample["audio_path"]
+        
+        if audio_path in self.lengths:
+            return self.lengths[audio_path]
+        
+        # Check if the audio file is missing
+        if sample.get("missing_audio", False):
+            # Use a default length for missing files
+            length = 16000 * 1  # Default to 1 second for missing files
+        else:
+            try:
+                # Try to get actual audio length
+                info = torchaudio.info(audio_path)
+                length = info.num_frames
+            except Exception:
+                # If file doesn't exist or has issues, use a default length
+                length = 16000 * 5  # Default to 5 seconds
+            
+        self.lengths[audio_path] = length
+        return length
+    
+    def __iter__(self):
+        # Get indices and their corresponding lengths
+        indices = list(range(len(self.dataset)))
+        
+        # Sort indices by length
+        try:
+            indices.sort(key=self.sort_key)
+        except Exception as e:
+            print(f"Warning: Error sorting by length: {e}. Using unsorted indices.")
+        
+        # Create buckets of size batch_size * bucket_size_multiplier
+        bucket_size = self.batch_size * self.bucket_size_multiplier
+        
+        # Split indices into buckets and shuffle each bucket
+        buckets = [indices[i:i + bucket_size] for i in range(0, len(indices), bucket_size)]
+        
+        if self.shuffle:
+            # Shuffle the order of buckets
+            random.shuffle(buckets)
+            
+            # Shuffle samples within each bucket
+            for bucket in buckets:
+                random.shuffle(bucket)
+        
+        # Create batches from buckets
+        batches = []
+        for bucket in buckets:
+            for i in range(0, len(bucket), self.batch_size):
+                batch = bucket[i:i + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+        
+        # Shuffle the order of batches if needed
+        if self.shuffle:
+            random.shuffle(batches)
+        
+        # Flatten batches
+        for batch in batches:
+            yield batch
+    
+    def __len__(self):
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        else:
+            return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+
+def create_length_sorted_dataloader(
+    manifest_path: str,
+    processor: XLSRTransducerProcessor,
+    batch_size: int = 8,
+    max_duration: Optional[float] = None,
+    min_duration: Optional[float] = None,
+    audio_dir: Optional[str] = None,
+    num_workers: int = 4,
+    shuffle: bool = True,
+    drop_last: bool = False,
+    bucket_size_multiplier: int = 5,
+    debug: bool = False
+) -> DataLoader:
+    """
+    Create a DataLoader with length-based batch sampling for the Estonian ASR dataset.
+    This reduces padding and improves training efficiency.
+    
+    Args:
+        manifest_path: Path to the manifest file
+        processor: Processor for audio and text
+        batch_size: Batch size
+        max_duration: Maximum duration of audio in seconds
+        min_duration: Minimum duration of audio in seconds
+        audio_dir: Base directory for audio files if paths in manifest are relative
+        num_workers: Number of workers for DataLoader
+        shuffle: Whether to shuffle the dataset
+        drop_last: Whether to drop the last incomplete batch
+        bucket_size_multiplier: Multiplier for bucket size (larger values = more randomness)
+        debug: Whether to run in debug mode (include missing files with dummy audio)
+        
+    Returns:
+        DataLoader for the dataset with length-based batch sampling
+    """
+    import random
+    
+    dataset = EstonianASRDataset(
+        manifest_path=manifest_path,
+        processor=processor,
+        max_duration=max_duration,
+        min_duration=min_duration,
+        audio_dir=audio_dir,
+        debug=debug
+    )
+    
+    # Create length-based batch sampler
+    batch_sampler = LengthBatchSampler(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        bucket_size_multiplier=bucket_size_multiplier
+    )
+    
+    return DataLoader(
+        dataset=dataset,
+        batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True

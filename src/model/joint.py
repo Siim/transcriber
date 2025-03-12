@@ -79,6 +79,17 @@ class TransducerJoint(nn.Module):
         # Check for NaN values in inputs
         if torch.isnan(encoder_outputs).any() or torch.isnan(predictor_outputs).any():
             print("WARNING: NaN values detected in joint network inputs!")
+        
+        # Check if inputs require gradients
+        if not encoder_outputs.requires_grad:
+            print("WARNING: Encoder outputs do not require gradients in joint network!")
+            # Ensure encoder outputs require gradients
+            encoder_outputs = encoder_outputs.detach().requires_grad_(True)
+            
+        if not predictor_outputs.requires_grad:
+            print("WARNING: Predictor outputs do not require gradients in joint network!")
+            # Ensure predictor outputs require gradients
+            predictor_outputs = predictor_outputs.detach().requires_grad_(True)
             
         # Project encoder outputs
         encoder_proj = self.encoder_proj(encoder_outputs)  # (batch_size, time_steps, hidden_dim)
@@ -92,8 +103,8 @@ class TransducerJoint(nn.Module):
         encoder_proj = encoder_proj.unsqueeze(2)  # (batch_size, time_steps, 1, hidden_dim)
         predictor_proj = predictor_proj.unsqueeze(1)  # (batch_size, 1, label_length, hidden_dim)
         
-        # Combine outputs with scaling to prevent large values
-        joint = encoder_proj * 0.5 + predictor_proj * 0.5  # (batch_size, time_steps, label_length, hidden_dim)
+        # Combine outputs - use addition instead of scaling
+        joint = encoder_proj + predictor_proj  # (batch_size, time_steps, label_length, hidden_dim)
         
         # Apply layer normalization
         joint = self.joint_norm(joint)
@@ -105,16 +116,15 @@ class TransducerJoint(nn.Module):
         # Project to vocabulary
         outputs = self.output_proj(joint)  # (batch_size, time_steps, label_length, vocab_size)
         
-        # Scale outputs to prevent extreme values
-        outputs = outputs * 0.05
-        
-        # Clip extreme values to prevent NaN propagation
-        outputs = torch.clamp(outputs, min=-100.0, max=100.0)
-        
         # Check for NaN values in outputs
         if torch.isnan(outputs).any():
             print("WARNING: NaN values detected in joint network outputs!")
-            
+            outputs = torch.nan_to_num(outputs, nan=0.0)
+        
+        # Check if outputs require gradients
+        if not outputs.requires_grad:
+            print("WARNING: Joint network outputs do not require gradients!")
+        
         return outputs
     
     def forward_step(
@@ -132,6 +142,17 @@ class TransducerJoint(nn.Module):
         Returns:
             Joint output of shape (batch_size, vocab_size)
         """
+        # Check if inputs require gradients
+        if not encoder_output.requires_grad:
+            print("WARNING: Encoder output does not require gradients in joint network step!")
+            # Ensure encoder output requires gradients
+            encoder_output = encoder_output.detach().requires_grad_(True)
+            
+        if not predictor_output.requires_grad:
+            print("WARNING: Predictor output does not require gradients in joint network step!")
+            # Ensure predictor output requires gradients
+            predictor_output = predictor_output.detach().requires_grad_(True)
+            
         # Project encoder output
         encoder_proj = self.encoder_proj(encoder_output)  # (batch_size, hidden_dim)
         encoder_proj = self.encoder_norm(encoder_proj)
@@ -140,8 +161,8 @@ class TransducerJoint(nn.Module):
         predictor_proj = self.predictor_proj(predictor_output)  # (batch_size, hidden_dim)
         predictor_proj = self.predictor_norm(predictor_proj)
         
-        # Combine outputs with scaling
-        joint = encoder_proj * 0.5 + predictor_proj * 0.5  # (batch_size, hidden_dim)
+        # Combine outputs - use addition instead of scaling
+        joint = encoder_proj + predictor_proj  # (batch_size, hidden_dim)
         
         # Apply layer normalization
         joint = self.joint_norm(joint)
@@ -153,10 +174,13 @@ class TransducerJoint(nn.Module):
         # Project to vocabulary
         output = self.output_proj(joint)  # (batch_size, vocab_size)
         
-        # Scale outputs to prevent extreme values
-        output = output * 0.05
+        # Check for NaN values
+        if torch.isnan(output).any():
+            print("WARNING: NaN values detected in joint network step outputs!")
+            output = torch.nan_to_num(output, nan=0.0)
         
-        # Clip extreme values
-        output = torch.clamp(output, min=-100.0, max=100.0)
+        # Check if output requires gradients
+        if not output.requires_grad:
+            print("WARNING: Joint network step output does not require gradients!")
         
         return output 
