@@ -533,14 +533,32 @@ class XLSREncoder(nn.Module):
         hidden_states = self.model.feature_projection(extract_features)
         
         # Run the encoder part - handle return value carefully
-        encoder_outputs = self.model.encoder(hidden_states, attention_mask=attention_mask)
+        try:
+            # Call encoder
+            encoder_outputs = self.model.encoder(hidden_states, attention_mask=attention_mask)
+            
+            # Process outputs based on the returned type
+            if isinstance(encoder_outputs, tuple):
+                # For tuple output (common in newer HF versions)
+                hidden_states = encoder_outputs[0]  # First element is hidden states
+            elif hasattr(encoder_outputs, 'last_hidden_state'):
+                # For BaseModelOutput type
+                hidden_states = encoder_outputs.last_hidden_state
+            else:
+                # For direct tensor output
+                hidden_states = encoder_outputs
+        except Exception as e:
+            print(f"Error in encoder forward: {e}")
+            # Fallback: if we've already extracted encoder_outputs and it's a tuple
+            if 'encoder_outputs' in locals() and isinstance(encoder_outputs, tuple) and len(encoder_outputs) > 0:
+                hidden_states = encoder_outputs[0]
+            else:
+                raise  # Re-raise if we can't recover
         
-        # The encoder returns a tuple in newer transformers versions, check the type
-        if isinstance(encoder_outputs, tuple):
-            hidden_states = encoder_outputs[0]  # First element is usually the hidden states
-        else:
-            # Handle BaseModelOutput or other return types
-            hidden_states = encoder_outputs.last_hidden_state if hasattr(encoder_outputs, 'last_hidden_state') else encoder_outputs
+        # Check for NaN values in hidden states
+        if torch.isnan(hidden_states).any():
+            print("WARNING: NaN values detected in encoder hidden states!")
+            hidden_states = torch.nan_to_num(hidden_states, nan=0.0)
         
         # Apply layer normalization for stability
         last_hidden_state = self.output_layer_norm(hidden_states)
