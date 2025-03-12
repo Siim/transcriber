@@ -9,7 +9,7 @@ data:
   sample_rate: 16000
   max_duration: 10.0  # Reduced from 30.0 to limit sequence lengths
   min_duration: 0.5
-  batch_size: 48
+  batch_size: 24
   num_workers: 8
 
 # Model configuration
