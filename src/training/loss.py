@@ -11,8 +11,10 @@ class TransducerLoss(nn.Module):
     """
     RNN-T loss implementation.
     
-    This implementation can use either a pure PyTorch implementation or
-    a CUDA implementation if available.
+    This implementation can use different backends:
+    1. CUDA implementation (warp-rnnt) - fastest for CUDA GPUs
+    2. PyTorch implementation with torchaudio - works with both CUDA and MPS
+    3. Pure PyTorch CPU implementation - slowest fallback
     """
     
     def __init__(
@@ -31,15 +33,47 @@ class TransducerLoss(nn.Module):
         self.blank_id = blank_id
         self.reduction = reduction
         
-        # Try to import CUDA implementation
+        # Track which implementation is being used
+        self.implementation = "cpu"
+        
+        # Try to import GPU implementations in order of preference
+        
+        # 1. Try warp-rnnt (CUDA only, fastest)
         try:
             import warp_rnnt
             self.warp_rnnt = warp_rnnt
-            self.use_cuda_implementation = True
-            logger.info("Using CUDA implementation of RNN-T loss")
+            self.implementation = "warp-rnnt"
+            logger.info("Using warp-rnnt CUDA implementation of RNN-T loss (fastest)")
+            return
         except ImportError:
-            self.use_cuda_implementation = False
-            logger.info("Using CPU implementation of RNN-T loss")
+            logger.info("warp-rnnt not available, trying other implementations...")
+        
+        # 2. Try torchaudio.functional.rnnt_loss (works on CUDA and MPS)
+        try:
+            import torchaudio.functional as F_audio
+            self.F_audio = F_audio
+            
+            # Check if we have a proper GPU (CUDA or MPS)
+            if torch.cuda.is_available() or hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.implementation = "torchaudio"
+                device_type = "CUDA" if torch.cuda.is_available() else "MPS"
+                logger.info(f"Using torchaudio implementation of RNN-T loss (optimized for {device_type})")
+                return
+        except (ImportError, AttributeError):
+            logger.info("torchaudio.functional.rnnt_loss not available, continuing...")
+        
+        # 3. Try fast_rnnt (optimized CPU/CUDA implementation)
+        try:
+            import fast_rnnt
+            self.fast_rnnt = fast_rnnt
+            self.implementation = "fast-rnnt"
+            logger.info("Using fast-rnnt implementation of RNN-T loss")
+            return
+        except ImportError:
+            logger.info("fast-rnnt not available, falling back to CPU implementation")
+        
+        # 4. Fallback to pure PyTorch CPU implementation
+        logger.info("Using pure PyTorch CPU implementation of RNN-T loss (slowest)")
     
     def forward(
         self,
@@ -92,19 +126,28 @@ class TransducerLoss(nn.Module):
         vocab_size = logits.size(-1)
         labels_clipped = torch.clamp(labels, 0, vocab_size - 1)
         
-        # Compute the actual loss - use CUDA implementation if available
-        if self.use_cuda_implementation and device.type == "cuda":
-            try:
-                loss = self._compute_loss_cuda(
+        # Choose implementation based on device and available libraries
+        try:
+            # Use the appropriate implementation based on device and what's available
+            if self.implementation == "warp-rnnt" and device.type == "cuda":
+                loss = self._compute_loss_warp_rnnt(
                     logits, labels_clipped, input_lengths, label_lengths
                 )
-            except Exception as e:
-                logger.warning(f"Error using CUDA implementation: {e}. Falling back to CPU implementation.")
+            elif self.implementation == "torchaudio" and (device.type == "cuda" or device.type == "mps"):
+                loss = self._compute_loss_torchaudio(
+                    logits, labels_clipped, input_lengths, label_lengths
+                )
+            elif self.implementation == "fast-rnnt" and (device.type == "cuda" or device.type == "cpu"):
+                loss = self._compute_loss_fast_rnnt(
+                    logits, labels_clipped, input_lengths, label_lengths
+                )
+            else:
+                # Fall back to CPU implementation
                 loss = self._compute_loss_cpu(
                     logits, labels_clipped, input_lengths, label_lengths
                 )
-        else:
-            # Use CPU implementation
+        except Exception as e:
+            logger.warning(f"Error using {self.implementation} implementation: {e}. Falling back to CPU implementation.")
             loss = self._compute_loss_cpu(
                 logits, labels_clipped, input_lengths, label_lengths
             )
@@ -117,6 +160,113 @@ class TransducerLoss(nn.Module):
         # Log warning if loss doesn't require gradients
         if not loss.requires_grad:
             logger.warning("Loss does not require gradients. This will prevent backpropagation.")
+        
+        return loss
+    
+    def _compute_loss_warp_rnnt(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        input_lengths: torch.Tensor,
+        label_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the transducer loss using the warp-rnnt CUDA implementation.
+        
+        Args:
+            logits: Joint network outputs [batch_size, max_time, max_label, vocab_size]
+            labels: Label sequences [batch_size, max_label_length]
+            input_lengths: Length of input sequences [batch_size]
+            label_lengths: Length of label sequences [batch_size]
+            
+        Returns:
+            Loss tensor
+        """
+        # Ensure contiguous memory layout for CUDA
+        log_probs = F.log_softmax(logits, dim=-1).contiguous()
+        
+        # Compute the loss
+        loss = self.warp_rnnt.rnnt_loss(
+            log_probs,
+            labels.int(),
+            input_lengths.int(),
+            label_lengths.int(),
+            blank=self.blank_id,
+            reduction=self.reduction
+        )
+        
+        return loss
+    
+    def _compute_loss_torchaudio(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        input_lengths: torch.Tensor,
+        label_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the transducer loss using torchaudio implementation.
+        Works on both CUDA and MPS.
+        
+        Args:
+            logits: Joint network outputs [batch_size, max_time, max_label, vocab_size]
+            labels: Label sequences [batch_size, max_label_length]
+            input_lengths: Length of input sequences [batch_size]
+            label_lengths: Length of label sequences [batch_size]
+            
+        Returns:
+            Loss tensor
+        """
+        # Ensure contiguous memory layout
+        log_probs = F.log_softmax(logits, dim=-1).contiguous()
+        
+        # torchaudio expects [T, B, U, V] layout but our tensor is [B, T, U, V]
+        # so we need to permute
+        log_probs = log_probs.permute(1, 0, 2, 3)
+        
+        # Compute the loss
+        neg_log_likelihood = self.F_audio.rnnt_loss(
+            log_probs,
+            labels,
+            input_lengths,
+            label_lengths,
+            blank=self.blank_id,
+            reduction=self.reduction
+        )
+        
+        return neg_log_likelihood
+    
+    def _compute_loss_fast_rnnt(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        input_lengths: torch.Tensor,
+        label_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the transducer loss using fast-rnnt implementation.
+        
+        Args:
+            logits: Joint network outputs [batch_size, max_time, max_label, vocab_size]
+            labels: Label sequences [batch_size, max_label_length]
+            input_lengths: Length of input sequences [batch_size]
+            label_lengths: Length of label sequences [batch_size]
+            
+        Returns:
+            Loss tensor
+        """
+        # Ensure contiguous memory layout
+        log_probs = F.log_softmax(logits, dim=-1).contiguous()
+        
+        # Compute the loss
+        loss = self.fast_rnnt.rnnt_loss_simple(
+            log_probs,
+            labels,
+            input_lengths,
+            label_lengths,
+            blank=self.blank_id,
+            reduction=self.reduction
+        )
         
         return loss
     
@@ -187,47 +337,6 @@ class TransducerLoss(nn.Module):
             return losses.sum()
         else:  # 'none'
             return losses
-    
-    def _compute_loss_cuda(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        input_lengths: torch.Tensor,
-        label_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute the transducer loss using CUDA implementation.
-        
-        Args:
-            logits: Joint network outputs [batch_size, max_time, max_label, vocab_size]
-            labels: Label sequences [batch_size, max_label_length]
-            input_lengths: Length of input sequences [batch_size]
-            label_lengths: Length of label sequences [batch_size]
-            
-        Returns:
-            Loss tensor
-        """
-        batch_size = logits.size(0)
-        max_time = logits.size(1)
-        max_label = logits.size(2)
-        
-        # Ensure contiguous memory layout for CUDA
-        log_probs = F.log_softmax(logits, dim=-1).contiguous()
-        
-        # The warp-rnnt expects [B, T, U, V] layout but Pytorch is [B, T, U, V]
-        # so we're already good
-        
-        # Compute the loss
-        loss = self.warp_rnnt.rnnt_loss(
-            log_probs,
-            labels.int(),
-            input_lengths.int(),
-            label_lengths.int(),
-            blank=self.blank_id,
-            reduction=self.reduction
-        )
-        
-        return loss
     
     def _compute_forward_variables(
         self,
