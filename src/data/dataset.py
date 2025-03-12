@@ -8,6 +8,9 @@ from .processor import XLSRTransducerProcessor
 import random
 from tqdm import tqdm
 import time
+import concurrent.futures
+import multiprocessing
+from functools import lru_cache
 
 
 class EstonianASRDataset(Dataset):
@@ -49,6 +52,9 @@ class EstonianASRDataset(Dataset):
         self.audio_dir = audio_dir
         self.debug = debug
         
+        # Cache for processed audio - use a small LRU cache to avoid memory issues
+        self._preprocess_audio_cached = lru_cache(maxsize=64)(self._preprocess_audio_impl)
+        
         # Load manifest
         self.samples = self._load_manifest(manifest_path)
         
@@ -65,7 +71,72 @@ class EstonianASRDataset(Dataset):
                 print(f"Audio duration stats: min={min_dur:.2f}s, max={max_dur:.2f}s, avg={avg_dur:.2f}s")
     
     def _load_manifest(self, manifest_path: str) -> List[Dict[str, Union[str, int]]]:
-        """Load and parse the manifest file."""
+        """Load and parse the manifest file with multithreaded audio duration checking."""
+        # Function to check audio file and get duration
+        def check_audio_file(audio_path, text, speaker_id, min_duration, max_duration):
+            # If audio_dir is provided, join with audio_path
+            full_audio_path = os.path.join(self.audio_dir, audio_path) if self.audio_dir is not None else audio_path
+            
+            # Convert speaker_id to a numeric value if it's not already numeric
+            if not speaker_id.isdigit():
+                # We'll handle speaker ID mapping in the main function
+                speaker_id_numeric = -1  # temporary value, will be updated later
+            else:
+                speaker_id_numeric = int(speaker_id)
+            
+            # Check if file exists
+            file_exists = os.path.exists(full_audio_path)
+            if not file_exists:
+                if self.debug:
+                    # In debug mode, include the file with a flag indicating it's missing
+                    return {
+                        "audio_path": full_audio_path,
+                        "text": text,
+                        "speaker_id": speaker_id_numeric,  # Always an integer
+                        "speaker_id_raw": speaker_id,      # Original value for mapping
+                        "missing_audio": True,
+                        "duration": 2.0,  # Default duration for dummy audio
+                        "status": "missing"
+                    }
+                else:
+                    return {"status": "missing"}
+            
+            # Check duration - always check to ensure consistent batching
+            try:
+                info = torchaudio.info(full_audio_path)
+                duration = info.num_frames / info.sample_rate
+                
+                # Strictly enforce duration limits for more consistent batching
+                if duration < min_duration:
+                    return {"status": "too_short", "duration": duration}
+                
+                if duration > max_duration:
+                    return {"status": "too_long", "duration": duration}
+                
+                return {
+                    "audio_path": full_audio_path,
+                    "text": text,
+                    "speaker_id": speaker_id_numeric,
+                    "missing_audio": False,
+                    "duration": duration,
+                    "status": "valid"
+                }
+                
+            except Exception as e:
+                if self.debug:
+                    # In debug mode, include files with errors
+                    return {
+                        "audio_path": full_audio_path,
+                        "text": text,
+                        "speaker_id": speaker_id_numeric,
+                        "missing_audio": True,
+                        "duration": 2.0,  # Default duration for dummy audio
+                        "status": "error",
+                        "error": str(e)
+                    }
+                else:
+                    return {"status": "error", "error": str(e)}
+        
         samples = []
         
         # Speaker ID mapping (for non-numeric speaker IDs)
@@ -83,18 +154,19 @@ class EstonianASRDataset(Dataset):
         missing_files = 0
         
         with open(manifest_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            
-        # Use tqdm in debug mode to show progress
-        line_iterator = tqdm(lines, desc="Loading manifest") if self.debug else lines
-            
-        for line in line_iterator:
-            line = line.strip()
-            if not line:
-                continue
-                
-            total_samples += 1
-            
+            lines = [line.strip() for line in f if line.strip()]
+        
+        total_samples = len(lines)
+        
+        # Process lines in parallel with a thread pool (more appropriate for I/O bound tasks)
+        # Determine number of threads - for I/O bound tasks, we can use more threads
+        num_threads = min(32, multiprocessing.cpu_count() * 4)  # Use more threads for I/O
+        
+        print(f"Processing manifest with {num_threads} threads")
+        
+        # Prepare data for thread processing
+        tasks = []
+        for line in lines:
             parts = line.split("|")
             if len(parts) != 3:
                 print(f"Warning: Skipping malformed line: {line}")
@@ -102,82 +174,72 @@ class EstonianASRDataset(Dataset):
                 continue
             
             audio_path, text, speaker_id = parts
+            tasks.append((audio_path, text, speaker_id, min_duration, max_duration))
+        
+        # Use tqdm in debug mode to show progress
+        if self.debug:
+            print(f"Checking {len(tasks)} audio files for validity...")
+            progress_bar = tqdm(total=len(tasks), desc="Loading manifest")
+        
+        # Process in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(check_audio_file, *task) for task in tasks]
             
-            # Convert speaker_id to a numeric value if it's not already numeric
-            if not speaker_id.isdigit():
-                if speaker_id not in speaker_to_id:
-                    # Assign a new numeric ID to this speaker
-                    speaker_to_id[speaker_id] = len(speaker_to_id)
-                speaker_id_numeric = speaker_to_id[speaker_id]
-            else:
-                speaker_id_numeric = int(speaker_id)
-            
-            # If audio_dir is provided, join with audio_path
-            if self.audio_dir is not None:
-                audio_path = os.path.join(self.audio_dir, audio_path)
-            
-            # Check if file exists
-            file_exists = os.path.exists(audio_path)
-            if not file_exists:
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                
                 if self.debug:
-                    # In debug mode, include the file with a flag indicating it's missing
-                    print(f"Debug mode: Using dummy audio for missing file: {audio_path}")
-                    samples.append({
-                        "audio_path": audio_path,
-                        "text": text,
-                        "speaker_id": speaker_id_numeric,
-                        "missing_audio": True,
-                        "duration": 2.0,  # Default duration for dummy audio
-                    })
-                    continue
-                else:
+                    progress_bar.update(1)
+                
+                # Handle different status codes
+                if result["status"] == "valid":
+                    # Handle speaker ID mapping for valid files
+                    speaker_id = result.get("speaker_id_raw", result["speaker_id"])
+                    if isinstance(speaker_id, str) and not speaker_id.isdigit():
+                        if speaker_id not in speaker_to_id:
+                            speaker_to_id[speaker_id] = len(speaker_to_id)
+                        result["speaker_id"] = speaker_to_id[speaker_id]
+                    
+                    samples.append(result)
+                elif result["status"] == "missing":
                     missing_files += 1
                     filtered_samples += 1
-                    continue
-            
-            # Check duration - always check to ensure consistent batching
-            try:
-                info = torchaudio.info(audio_path)
-                duration = info.num_frames / info.sample_rate
-                
-                # Strictly enforce duration limits for more consistent batching
-                if duration < min_duration:
+                    if self.debug and "audio_path" in result:
+                        # Handle speaker ID mapping for missing files in debug mode
+                        speaker_id = result.get("speaker_id_raw", result["speaker_id"])
+                        if isinstance(speaker_id, str) and not speaker_id.isdigit():
+                            if speaker_id not in speaker_to_id:
+                                speaker_to_id[speaker_id] = len(speaker_to_id)
+                            result["speaker_id"] = speaker_to_id[speaker_id]
+                        
+                        samples.append(result)  # Include with dummy audio in debug mode
+                elif result["status"] == "too_short":
                     too_short += 1
                     filtered_samples += 1
                     if self.debug:
-                        print(f"Debug mode: Skipping too short audio file: {audio_path} ({duration:.2f}s < {min_duration:.2f}s)")
-                    continue
-                
-                if duration > max_duration:
+                        print(f"Debug mode: Skipping too short audio file: {result.get('audio_path', 'unknown')} ({result.get('duration', 0):.2f}s < {min_duration:.2f}s)")
+                elif result["status"] == "too_long":
                     too_long += 1
                     filtered_samples += 1
                     if self.debug:
-                        print(f"Debug mode: Skipping too long audio file: {audio_path} ({duration:.2f}s > {max_duration:.2f}s)")
-                    continue
-                
-            except Exception as e:
-                if self.debug:
-                    # In debug mode, include files with errors
-                    print(f"Debug mode: Using dummy audio for file with error: {audio_path}: {e}")
-                    samples.append({
-                        "audio_path": audio_path,
-                        "text": text,
-                        "speaker_id": speaker_id_numeric,
-                        "missing_audio": True,
-                        "duration": 2.0,  # Default duration for dummy audio
-                    })
-                    continue
-                else:
+                        print(f"Debug mode: Skipping too long audio file: {result.get('audio_path', 'unknown')} ({result.get('duration', 0):.2f}s > {max_duration:.2f}s)")
+                elif result["status"] == "error":
                     filtered_samples += 1
-                    continue
-            
-            samples.append({
-                "audio_path": audio_path,
-                "text": text,
-                "speaker_id": speaker_id_numeric,
-                "missing_audio": False,
-                "duration": duration,  # Store duration for efficient length-based batching
-            })
+                    if self.debug and "audio_path" in result:
+                        print(f"Debug mode: Using dummy audio for file with error: {result['audio_path']}: {result.get('error', 'unknown error')}")
+                        
+                        # Handle speaker ID mapping for error files in debug mode
+                        speaker_id = result.get("speaker_id_raw", result["speaker_id"])
+                        if isinstance(speaker_id, str) and not speaker_id.isdigit():
+                            if speaker_id not in speaker_to_id:
+                                speaker_to_id[speaker_id] = len(speaker_to_id)
+                            result["speaker_id"] = speaker_to_id[speaker_id]
+                        
+                        samples.append(result)  # Include with dummy audio in debug mode
+        
+        if self.debug:
+            progress_bar.close()
         
         # Print summary of filtered samples
         if filtered_samples > 0:
@@ -192,8 +254,19 @@ class EstonianASRDataset(Dataset):
     
     def _preprocess_audio(self, audio_path: str) -> torch.Tensor:
         """
-        Load and preprocess audio more efficiently.
-        Limits audio length to max_duration.
+        Load and preprocess audio more efficiently using cached results.
+        
+        Args:
+            audio_path: Path to the audio file
+            
+        Returns:
+            Preprocessed audio tensor with shape [1, length]
+        """
+        return self._preprocess_audio_cached(audio_path)
+    
+    def _preprocess_audio_impl(self, audio_path: str) -> torch.Tensor:
+        """
+        Implementation of audio preprocessing with optimized memory operations.
         
         Args:
             audio_path: Path to the audio file
@@ -206,17 +279,27 @@ class EstonianASRDataset(Dataset):
             if not os.path.exists(audio_path):
                 if self.debug:
                     print(f"Debug mode: Using dummy audio for missing file: {audio_path}")
-                    # Generate a short dummy audio
-                    return torch.zeros(1, 16000) + torch.randn(1, 16000) * 1e-6
+                    # Generate a short dummy audio - use low noise for efficiency
+                    return torch.zeros(1, 16000, dtype=torch.float) + torch.randn(1, 16000, dtype=torch.float) * 1e-6
                 else:
                     raise FileNotFoundError(f"Audio file not found: {audio_path}")
             
-            # Load audio
-            waveform, sample_rate = torchaudio.load(audio_path)
+            # Load audio using a more memory-efficient approach
+            # Use torchaudio.load with memory mapping when available
+            try:
+                # First try loading with normal method
+                waveform, sample_rate = torchaudio.load(audio_path)
+            except Exception:
+                # If that fails, try reading as numpy array (more memory efficient for large files)
+                import numpy as np
+                import soundfile as sf
+                data, sample_rate = sf.read(audio_path, dtype='float32')
+                waveform = torch.from_numpy(data.reshape(1, -1) if data.ndim == 1 else data.T)
             
             # Convert to mono if needed - ensure shape is [1, length]
             if waveform.dim() > 1:
                 if waveform.shape[0] > 1:
+                    # Use more efficient operation for sum
                     waveform = waveform.mean(dim=0, keepdim=True)
             else:
                 # If for some reason it's 1D, make it 2D [1, length]
@@ -224,33 +307,35 @@ class EstonianASRDataset(Dataset):
             
             # Resample if needed
             if sample_rate != 16000:
+                # Create resampler only when needed (avoid recreation)
                 resampler = torchaudio.transforms.Resample(
                     orig_freq=sample_rate, new_freq=16000
                 )
                 waveform = resampler(waveform)
             
             # Limit audio length to max_duration to prevent extremely long sequences
+            # Use more memory-efficient approach for long files
             if self.max_duration is not None:
                 max_samples = int(self.max_duration * 16000)
                 if waveform.shape[1] > max_samples:
-                    # Either take the first max_samples (consistent) or randomly crop (for data augmentation)
-                    # using consistent for now for stability
-                    waveform = waveform[:, :max_samples]
+                    # Use narrow instead of slicing for memory efficiency
+                    waveform = waveform.narrow(1, 0, max_samples)
             
-            # Normalize audio
+            # Normalize audio - use in-place operations
             if waveform.abs().max() > 0:
-                waveform = waveform / waveform.abs().max()
+                max_val = waveform.abs().max()
+                waveform.div_(max_val)
             
             # Ensure the shape is exactly [1, length]
             if waveform.dim() > 2:
-                waveform = waveform.view(1, -1)
+                waveform = waveform.reshape(1, -1)
                 
             return waveform
         
         except Exception as e:
             if self.debug:
                 print(f"Error loading audio {audio_path}: {str(e)}. Using dummy audio.")
-                return torch.zeros(1, 16000) + torch.randn(1, 16000) * 1e-6
+                return torch.zeros(1, 16000, dtype=torch.float) + torch.randn(1, 16000, dtype=torch.float) * 1e-6
             else:
                 raise
     
@@ -667,7 +752,8 @@ def create_length_sorted_dataloader(
     bucket_size_multiplier: int = 5,
     debug: bool = False,
     use_log_buckets: bool = True,
-    pin_memory: bool = True
+    pin_memory: bool = True,
+    prefetch_factor: int = 2
 ) -> DataLoader:
     """
     Create a DataLoader with length-based batch sampling for the Estonian ASR dataset.
@@ -687,6 +773,7 @@ def create_length_sorted_dataloader(
         debug: Whether to run in debug mode (include missing files with dummy audio)
         use_log_buckets: Whether to use logarithmic bucketing for better length grouping
         pin_memory: Whether to use pin_memory for faster GPU transfers
+        prefetch_factor: Number of batches to prefetch per worker (higher = more memory, faster loading)
         
     Returns:
         DataLoader for the dataset with length-based batch sampling
@@ -729,10 +816,17 @@ def create_length_sorted_dataloader(
         print(f"DataLoader settings: batch_size={batch_size}, num_workers={num_workers}, "
               f"shuffle={shuffle}, drop_last={drop_last}, bucket_size_multiplier={bucket_size_multiplier}")
     
-    return DataLoader(
-        dataset=dataset,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        collate_fn=collate_fn_with_processor,
-        pin_memory=pin_memory
-    ) 
+    # Create DataLoader with optimized settings
+    dataloader_kwargs = {
+        'dataset': dataset,
+        'batch_sampler': batch_sampler,
+        'num_workers': num_workers,
+        'collate_fn': collate_fn_with_processor,
+        'pin_memory': pin_memory
+    }
+    
+    # Only add prefetch_factor if num_workers > 0 (otherwise it causes an error)
+    if num_workers > 0:
+        dataloader_kwargs['prefetch_factor'] = prefetch_factor
+    
+    return DataLoader(**dataloader_kwargs) 

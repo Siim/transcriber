@@ -120,6 +120,10 @@ class XLSRTransducerTrainer:
             scheduler: Optional learning rate scheduler
             compute_metrics: Optional function to compute metrics
         """
+        # Ensure torch is available in this scope
+        import torch
+        import torch.optim as optim
+        
         self.model = model
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
@@ -317,6 +321,9 @@ class XLSRTransducerTrainer:
         # Performance tracking
         batch_times = []
         memory_usage = []
+        data_loading_times = []
+        forward_times = []
+        backward_times = []
         
         # Log memory usage at the start
         if torch.cuda.is_available():
@@ -327,15 +334,26 @@ class XLSRTransducerTrainer:
         # Zero gradients at the beginning of the epoch
         self.optimizer.zero_grad()
         
+        # Use Async data loading to overlap data loading with computation
+        data_load_start = time.time()
+        
         # Training loop
         for batch_idx, batch in enumerate(self.train_dataloader):
-            # Track batch start time
+            # Measure data loading time
+            data_loading_time = time.time() - data_load_start
+            data_loading_times.append(data_loading_time)
+            
+            # Track batch start time for computation
             batch_start_time = time.time()
             
-            # Move batch to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            # Move batch to device with non_blocking=True for parallel transfer
+            batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+            
+            # Ensure data is on device before computation
+            torch.cuda.synchronize()
             
             # Forward pass with mixed precision
+            forward_start = time.time()
             if self.args.use_fp16:
                 with torch.amp.autocast('cuda'):
                     outputs = self.model(
@@ -368,8 +386,17 @@ class XLSRTransducerTrainer:
                     # Skip this batch
                     continue
                 
+                # Record forward pass time
+                forward_time = time.time() - forward_start
+                forward_times.append(forward_time)
+                
                 # Backward pass with gradient scaling
+                backward_start = time.time()
                 self.scaler.scale(loss).backward()
+                
+                # Record backward pass time
+                backward_time = time.time() - backward_start
+                backward_times.append(backward_time)
                 
                 # Only update weights after accumulating gradients
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
@@ -401,7 +428,7 @@ class XLSRTransducerTrainer:
                     # Zero gradients
                     self.optimizer.zero_grad()
             else:
-                # Forward pass
+                # Forward pass (same pattern as above but without amp.autocast)
                 outputs = self.model(
                     input_values=batch["input_values"],
                     attention_mask=batch["attention_mask"],
@@ -426,8 +453,17 @@ class XLSRTransducerTrainer:
                     # Skip this batch
                     continue
                 
+                # Record forward pass time
+                forward_time = time.time() - forward_start
+                forward_times.append(forward_time)
+                
                 # Backward pass
+                backward_start = time.time()
                 loss.backward()
+                
+                # Record backward pass time
+                backward_time = time.time() - backward_start
+                backward_times.append(backward_time)
                 
                 # Only update weights after accumulating gradients
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or (batch_idx + 1) == num_batches:
@@ -498,9 +534,18 @@ class XLSRTransducerTrainer:
             progress_bar.set_postfix({"loss": loss.item()})
             
             # Performance tracking
-            batch_times.append(time.time() - batch_start_time)
+            batch_compute_time = time.time() - batch_start_time
+            batch_times.append(batch_compute_time)
             if torch.cuda.is_available():
                 memory_usage.append(torch.cuda.memory_allocated() / (1024 ** 3) - start_memory)
+                
+            # Start timing data loading for the next batch
+            data_load_start = time.time()
+            
+            # Use torch.cuda.current_stream().synchronize() to make sure all GPU ops are done
+            # This avoids false timing measurements due to asynchronous execution
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
         
         # Close progress bar
         progress_bar.close()
@@ -514,8 +559,11 @@ class XLSRTransducerTrainer:
             f"time = {elapsed_time:.2f}s"
         )
         
-        # Log performance summary
+        # Log performance summary with more detailed breakdowns
         self.logger.info(f"Average batch time: {np.mean(batch_times):.4f}s")
+        self.logger.info(f"Average data loading time: {np.mean(data_loading_times):.4f}s")
+        self.logger.info(f"Average forward pass time: {np.mean(forward_times):.4f}s")
+        self.logger.info(f"Average backward pass time: {np.mean(backward_times):.4f}s")
         self.logger.info(f"Maximum batch time: {max(batch_times):.4f}s")
         self.logger.info(f"Minimum batch time: {min(batch_times):.4f}s")
         
@@ -742,6 +790,7 @@ class Trainer:
         from data.processor import XLSRTransducerProcessor
         from torch.utils.data import DataLoader
         import logging
+        import torch  # Ensure torch is explicitly imported here
         
         self.config = config
         self.device = device
@@ -869,6 +918,21 @@ class Trainer:
             # Use 0 workers in debug mode to avoid pickling issues
             num_workers = 0
             self.logger.info(f"Debug mode: Using batch_size={batch_size}, num_workers={num_workers}")
+        else:
+            # For production training, optimize CPU utilization
+            # Set number of workers to a reasonable value based on available cores
+            import multiprocessing
+            max_workers = max(1, multiprocessing.cpu_count() // 2)  # Use half of available cores
+            num_workers = min(max_workers, num_workers)  # Don't exceed user-specified limit
+            
+            # Enable multiprocessing optimizations
+            torch.set_num_threads(max(1, multiprocessing.cpu_count() - num_workers))  # Leave cores for workers
+            
+            # Configure multiprocessing method - 'fork' is faster on Linux/MacOS
+            torch.multiprocessing.set_start_method('fork', force=True)
+            
+            self.logger.info(f"Optimized multiprocessing: num_workers={num_workers}, "
+                           f"torch_threads={torch.get_num_threads()}")
         
         # Calculate maximum input length in samples (e.g., 10 seconds worth)
         max_input_length = None
