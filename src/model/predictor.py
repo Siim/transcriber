@@ -39,8 +39,14 @@ class TransducerPredictor(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         
+        # Layer normalization for stability
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
         # Output projection
         self.output_dim = hidden_dim
+        
+        # Initialize weights with smaller values to prevent exploding gradients
+        nn.init.xavier_uniform_(self.embedding.weight, gain=0.1)
     
     def forward(
         self,
@@ -62,6 +68,10 @@ class TransducerPredictor(nn.Module):
                 - hidden: Tuple of hidden states for LSTM
         """
         batch_size, max_label_length = labels.size()
+        
+        # Check for NaN values in input
+        if torch.isnan(labels.float()).any():
+            print("WARNING: NaN values detected in predictor input!")
         
         # Embed labels
         embedded = self.embedding(labels)  # (batch_size, max_label_length, embedding_dim)
@@ -98,8 +108,18 @@ class TransducerPredictor(nn.Module):
             # Forward through LSTM without packing
             outputs, hidden = self.lstm(embedded, hidden)
         
+        # Apply layer normalization for stability
+        outputs = self.layer_norm(outputs)
+        
         # Apply dropout
         outputs = self.dropout(outputs)
+        
+        # Clip extreme values to prevent NaN propagation
+        outputs = torch.clamp(outputs, min=-100.0, max=100.0)
+        
+        # Check for NaN values in output
+        if torch.isnan(outputs).any():
+            print("WARNING: NaN values detected in predictor output!")
         
         return {
             "outputs": outputs,
@@ -129,7 +149,13 @@ class TransducerPredictor(nn.Module):
         # Forward through LSTM
         output, hidden = self.lstm(embedded, hidden)
         
+        # Apply layer normalization
+        output = self.layer_norm(output)
+        
         # Apply dropout
         output = self.dropout(output)
+        
+        # Clip extreme values
+        output = torch.clamp(output, min=-100.0, max=100.0)
         
         return output.squeeze(1), hidden 

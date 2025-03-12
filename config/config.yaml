@@ -9,7 +9,7 @@ data:
   sample_rate: 16000
   max_duration: 30.0
   min_duration: 0.5
-  batch_size: 4
+  batch_size: 2
   num_workers: 4
 
 # Model configuration
@@ -32,20 +32,20 @@ model:
     embedding_dim: 256
     hidden_dim: 640
     num_layers: 2
-    dropout: 0.1
+    dropout: 0.0
   
   # Joint network configuration
   joint:
     hidden_dim: 640
-    activation: "relu"
+    activation: "tanh"
 
 # Training configuration
 training:
   num_epochs: 50
-  learning_rate: 0.00001
-  weight_decay: 0.00001
-  warmup_steps: 2000
-  grad_clip: 1.0
+  learning_rate: 0.000005
+  weight_decay: 0.000001
+  warmup_steps: 5000
+  grad_clip: 0.5
   save_dir: "checkpoints"
   log_dir: "logs"
   output_dir: "outputs"
@@ -54,7 +54,7 @@ training:
   eval_interval: 1000
   save_interval: 5000
   early_stopping_patience: 5
-  scheduler: "linear"  # Options: "linear", "cosine", "constant"
+  scheduler: "constant"  # Options: "linear", "cosine", "constant"
   use_fp16: false
 
 # Tokenizer configuration

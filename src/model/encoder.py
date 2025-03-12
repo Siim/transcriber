@@ -386,6 +386,9 @@ class XLSREncoder(nn.Module):
             # Replace encoder layers
             self.model.encoder.layers = nn.ModuleList(streaming_layers)
         
+        # Add output layer normalization for stability
+        self.output_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
         # Output projection
         self.output_dim = config.hidden_size
         
@@ -408,6 +411,10 @@ class XLSREncoder(nn.Module):
                 - last_hidden_state: Output tensor of shape (batch_size, seq_len, hidden_size)
                 - hidden_states: Optional tuple of hidden states
         """
+        # Check for NaN values in input
+        if torch.isnan(input_values).any():
+            print("WARNING: NaN values detected in encoder input!")
+            
         outputs = self.model(
             input_values=input_values,
             attention_mask=attention_mask,
@@ -415,7 +422,17 @@ class XLSREncoder(nn.Module):
             return_dict=True,
         )
         
+        # Apply layer normalization for stability
+        last_hidden_state = self.output_layer_norm(outputs.last_hidden_state)
+        
+        # Clip extreme values to prevent NaN propagation
+        last_hidden_state = torch.clamp(last_hidden_state, min=-100.0, max=100.0)
+        
+        # Check for NaN values in output
+        if torch.isnan(last_hidden_state).any():
+            print("WARNING: NaN values detected in encoder output!")
+        
         return {
-            "last_hidden_state": outputs.last_hidden_state,
+            "last_hidden_state": last_hidden_state,
             "hidden_states": outputs.hidden_states if output_hidden_states else None,
         } 
