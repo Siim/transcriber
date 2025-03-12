@@ -167,12 +167,13 @@ class EstonianASRDataset(Dataset):
         return processed
 
 
-def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+def collate_fn(batch: List[Dict[str, torch.Tensor]], vocab_size: int = 60) -> Dict[str, torch.Tensor]:
     """
     Robust collate function for DataLoader.
     
     Args:
         batch: List of samples from the dataset
+        vocab_size: Size of the vocabulary for clamping label values
         
     Returns:
         Batched samples with padded sequences
@@ -182,6 +183,10 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     for sample in batch:
         if all(k in sample for k in ["input_values", "labels", "speaker_id"]):
             if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
+                # Check if any labels are out of range and clip them
+                if (sample["labels"] >= vocab_size).any():
+                    print(f"WARNING: Found label values >= vocab_size ({vocab_size}). Clipping to valid range.")
+                    sample["labels"] = torch.clamp(sample["labels"], max=vocab_size-1)
                 valid_batch.append(sample)
             else:
                 print(f"Skipping sample with empty tensor: input_values shape={sample['input_values'].shape}, labels shape={sample['labels'].shape}")

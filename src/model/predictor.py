@@ -90,6 +90,11 @@ class TransducerPredictor(nn.Module):
                 print(f"WARNING: Some label lengths exceed max_label_length ({max_label_length}). Clamping.")
                 label_lengths = torch.clamp(label_lengths, max=max_label_length)
         
+        # Safety check for label values that might be out of range for the embedding layer
+        if (labels >= self.vocab_size).any():
+            print(f"WARNING: Some label values are >= vocab_size ({self.vocab_size}). Clipping to valid range.")
+            labels = torch.clamp(labels, max=self.vocab_size-1)
+        
         # Embed labels
         embedded = self.embedding(labels)  # (batch_size, max_label_length, embedding_dim)
         embedded = self.dropout(embedded)
@@ -179,6 +184,11 @@ class TransducerPredictor(nn.Module):
             output: Output tensor of shape (batch_size, hidden_dim)
             hidden: Tuple of hidden states for LSTM
         """
+        # Safety check for label values that might be out of range for the embedding layer
+        if (label >= self.vocab_size).any():
+            print(f"WARNING: Some label values are >= vocab_size ({self.vocab_size}). Clipping to valid range.")
+            label = torch.clamp(label, max=self.vocab_size-1)
+            
         # Embed label
         embedded = self.embedding(label)  # (batch_size, 1, embedding_dim)
         embedded = self.dropout(embedded)

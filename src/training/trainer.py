@@ -20,8 +20,14 @@ from data.processor import XLSRTransducerProcessor
 def robust_collate_fn(batch, processor=None, logger=None):
     """
     Enhanced collate function that handles potential errors in batches.
+    Ensures label values are within the valid vocabulary range.
     """
     import torch
+    
+    # Get the vocab_size if processor is available
+    vocab_size = 60  # Default fallback
+    if processor is not None:
+        vocab_size = processor.vocab_size
     
     # Filter out any problematic samples
     valid_batch = []
@@ -29,6 +35,12 @@ def robust_collate_fn(batch, processor=None, logger=None):
         # Check if all required keys are present and not empty
         if all(k in sample and sample[k] is not None for k in ["input_values", "labels", "speaker_id"]):
             if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
+                # Check if any labels are out of range
+                if (sample["labels"] >= vocab_size).any():
+                    if logger:
+                        logger.warning(f"Found label values >= vocab_size ({vocab_size}). Clipping to valid range.")
+                    # Clip label values to be within valid range
+                    sample["labels"] = torch.clamp(sample["labels"], max=vocab_size-1)
                 valid_batch.append(sample)
             else:
                 if logger:
@@ -54,7 +66,7 @@ def robust_collate_fn(batch, processor=None, logger=None):
         valid_batch = [dummy_sample, dummy_sample]  # Need at least 2 for batch
     
     # Use the original collate function with the valid batch
-    return collate_fn(valid_batch)
+    return collate_fn(valid_batch, vocab_size=vocab_size)
 
 
 @dataclass

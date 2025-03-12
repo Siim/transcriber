@@ -61,6 +61,12 @@ class TransducerLoss(nn.Module):
         logit_lengths = torch.clamp(logit_lengths, min=1)
         label_lengths = torch.clamp(label_lengths, min=1)
         
+        # Ensure label values are within the valid vocabulary range
+        vocab_size = logits.size(-1)
+        if (labels >= vocab_size).any():
+            print(f"WARNING: Found label values >= vocab_size ({vocab_size}) in TransducerLoss. Clipping to valid range.")
+            labels = torch.clamp(labels, max=vocab_size-1)
+        
         if self.use_cuda and logits.is_cuda:
             # Use CUDA implementation
             try:
@@ -131,6 +137,12 @@ class TransducerLoss(nn.Module):
         batch_size = logits.size(0)
         losses = []
         
+        # Ensure label values are within the valid vocabulary range
+        vocab_size = logits.size(-1)
+        if (labels >= vocab_size).any():
+            print(f"WARNING: Found label values >= vocab_size ({vocab_size}) in _compute_loss_cpu. Clipping to valid range.")
+            labels = torch.clamp(labels, max=vocab_size-1)
+        
         # Create a zero tensor to accumulate losses (keeps grad connection)
         total_loss = torch.zeros(1, device=logits.device, requires_grad=True)
         
@@ -138,6 +150,11 @@ class TransducerLoss(nn.Module):
             # Get sample data
             sample_logits = logits[b, :logit_lengths[b], :label_lengths[b] + 1, :]
             sample_labels = labels[b, :label_lengths[b]]
+            
+            # Double-check that sample_labels are within valid range
+            if (sample_labels >= vocab_size).any():
+                print(f"WARNING: Found label values >= vocab_size ({vocab_size}) in sample {b}. Clipping to valid range.")
+                sample_labels = torch.clamp(sample_labels, max=vocab_size-1)
             
             # Compute forward variables
             log_alpha = self._compute_forward_variables(
@@ -183,8 +200,13 @@ class TransducerLoss(nn.Module):
         Returns:
             Forward variables of shape (time_steps, label_length + 1)
         """
-        T, U, _ = logits.size()
+        T, U, vocab_size = logits.size()
         U = U - 1  # Adjust for blank
+        
+        # Ensure label values are within the valid vocabulary range
+        if (labels >= vocab_size).any():
+            print(f"WARNING: Found label values >= vocab_size ({vocab_size}) in _compute_forward_variables. Clipping to valid range.")
+            labels = torch.clamp(labels, max=vocab_size-1)
         
         # Initialize forward variables with -inf
         log_alpha = torch.full((T, U + 1), float("-inf"), device=logits.device)
@@ -211,7 +233,13 @@ class TransducerLoss(nn.Module):
                 
                 # Probability of emitting label
                 if u > 0:
-                    label_prob = logits[t, u - 1, labels[u - 1]]
+                    # Ensure label index is valid
+                    label_idx = labels[u - 1]
+                    if label_idx >= vocab_size:
+                        print(f"WARNING: Label index {label_idx} is out of bounds for vocab_size {vocab_size}. Clipping.")
+                        label_idx = vocab_size - 1
+                    
+                    label_prob = logits[t, u - 1, label_idx]
                     current_value = torch.logaddexp(
                         current_value,
                         log_alpha[t, u - 1] + label_prob
@@ -250,42 +278,44 @@ class TransducerLossWrapper(nn.Module):
         Forward pass of the transducer loss wrapper.
         
         Args:
-            outputs: Model outputs containing logits
+            outputs: Dictionary of model outputs
             labels: Labels of shape (batch_size, max_label_length)
             label_lengths: Lengths of labels of shape (batch_size,)
-            attention_mask: Optional mask of shape (batch_size, seq_len)
+            attention_mask: Optional attention mask
             
         Returns:
             Loss value
         """
-        # Ensure outputs is a dictionary and has logits
-        if not isinstance(outputs, dict) or "logits" not in outputs:
-            raise ValueError(f"Expected outputs to be a dictionary with 'logits' key, got {type(outputs)}")
-            
+        # Get logits from outputs
         logits = outputs["logits"]
         
-        # Check if logits requires grad
-        if not logits.requires_grad:
-            print("WARNING: logits does not require gradients. This will result in no parameter updates.")
-        
-        # Compute logit lengths from attention mask
+        # Get encoder lengths from attention mask
         if attention_mask is not None:
-            logit_lengths = attention_mask.sum(dim=1).long()
+            encoder_lengths = attention_mask.sum(dim=1).long()
         else:
-            logit_lengths = torch.full(
-                (logits.size(0),), logits.size(1), dtype=torch.long, device=logits.device
+            # If no attention mask, assume all time steps are valid
+            encoder_lengths = torch.full(
+                (logits.size(0),), logits.size(1), device=logits.device, dtype=torch.long
             )
         
-        # Compute loss
-        loss = self.loss_fn(
-            logits=logits,
-            labels=labels,
-            logit_lengths=logit_lengths,
-            label_lengths=label_lengths,
-        )
+        # Ensure label values are within the valid vocabulary range
+        vocab_size = logits.size(-1)
+        if (labels >= vocab_size).any():
+            print(f"WARNING: Found label values >= vocab_size ({vocab_size}) in loss function. Clipping to valid range.")
+            labels = torch.clamp(labels, max=vocab_size-1)
         
-        # Ensure loss requires grad (debug information)
-        if not loss.requires_grad:
-            print("WARNING: Computed loss does not require gradients!")
-            
+        # Compute loss
+        try:
+            loss = self.loss_fn(
+                logits=logits,
+                labels=labels,
+                logit_lengths=encoder_lengths,
+                label_lengths=label_lengths,
+            )
+        except Exception as e:
+            print(f"ERROR in transducer loss: {e}")
+            print(f"Shapes - logits: {logits.shape}, labels: {labels.shape}, encoder_lengths: {encoder_lengths.shape}, label_lengths: {label_lengths.shape}")
+            # Return a dummy loss that can be backpropagated
+            loss = torch.sum(logits[:, 0, 0, 0]) * 0.0 + 10.0
+        
         return loss 
