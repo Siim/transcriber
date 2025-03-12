@@ -77,7 +77,10 @@ def main():
     
     # Plot feature values
     plt.figure(figsize=(12, 4))
-    plt.plot(input_values[0, 0, :100].numpy())
+    if input_values.ndim == 3:
+        plt.plot(input_values[0, 0, :100].numpy())
+    else:
+        plt.plot(input_values[0, :100].numpy())
     plt.title("First 100 Feature Values")
     plt.grid(True)
     plt.savefig(os.path.join(args.output_dir, "feature_values.png"))

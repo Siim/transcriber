@@ -93,6 +93,31 @@ class AudioPreprocessor:
                 do_normalize=True  # Ensure normalization is enabled
             )
     
+    def _verify_audio(self, waveform: torch.Tensor, sample_rate: int, file_path: str = None) -> torch.Tensor:
+        """Verify that audio meets XLSR requirements."""
+        import logging
+        # Check sample rate
+        if sample_rate != self.sample_rate:
+            raise ValueError(f"Sample rate must be {self.sample_rate}Hz, got {sample_rate}Hz")
+
+        # Check that audio is mono
+        if waveform.dim() > 1 and waveform.shape[0] > 1:
+            logging.warning(f"Audio should be mono, got {waveform.shape[0]} channels for {file_path}. Converting to mono.")
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        # Check normalization range
+        min_val, max_val = waveform.min().item(), waveform.max().item()
+        if min_val < -1.01 or max_val > 1.01:
+            logging.warning(f"Audio values outside range [-1, 1]: min={min_val:.4f}, max={max_val:.4f} for {file_path}")
+            if waveform.abs().max() > 0:
+                waveform = waveform / waveform.abs().max()
+
+        # Log zero or constant audio
+        if waveform.std() < 1e-6:
+            logging.warning(f"Audio has very low variance (possibly silent or DC): std={waveform.std().item():.8f} for {file_path}")
+
+        return waveform
+    
     def __call__(
         self, 
         audio_path: str, 
@@ -102,16 +127,8 @@ class AudioPreprocessor:
         # Load audio
         waveform, sample_rate = torchaudio.load(audio_path)
         
-        # Convert to mono if needed
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-        
-        # Resample if needed
-        if sample_rate != self.sample_rate:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sample_rate, new_freq=self.sample_rate
-            )
-            waveform = resampler(waveform)
+        # Verify audio waveform
+        waveform = self._verify_audio(waveform, self.sample_rate, audio_path)
         
         # Trim to max_duration if specified
         if max_duration is not None:
@@ -119,12 +136,8 @@ class AudioPreprocessor:
             if waveform.shape[1] > max_samples:
                 waveform = waveform[:, :max_samples]
         
-        # Convert to numpy array and normalize to [-1, 1] range if not already
+        # Convert to numpy array
         waveform = waveform.squeeze().numpy()
-        
-        # Ensure the waveform is in the range [-1, 1]
-        if np.max(np.abs(waveform)) > 1.0:
-            waveform = waveform / np.max(np.abs(waveform))
         
         # Process with feature extractor
         inputs = self.feature_extractor(
