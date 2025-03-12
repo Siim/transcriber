@@ -81,22 +81,20 @@ class TransducerLoss(nn.Module):
         label_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute the transducer loss on CPU.
-        This is a simplified implementation and may be slow for large inputs.
+        Compute the transducer loss using CPU implementation.
         
         Args:
-            logits: Output tensor of shape (batch_size, time_steps, label_length, vocab_size)
+            logits: Output tensor of shape (batch_size, max_time_steps, max_label_length + 1, vocab_size)
             labels: Labels of shape (batch_size, max_label_length)
             logit_lengths: Lengths of logits of shape (batch_size,)
             label_lengths: Lengths of labels of shape (batch_size,)
             
         Returns:
-            Loss value
+            Loss tensor
         """
         batch_size = logits.size(0)
         losses = []
         
-        # Compute loss for each sample in the batch
         for b in range(batch_size):
             # Get sample data
             sample_logits = logits[b, :logit_lengths[b], :label_lengths[b] + 1, :]
@@ -110,7 +108,12 @@ class TransducerLoss(nn.Module):
             
             # Get the loss
             T, U = sample_logits.size(0), sample_labels.size(0) + 1
-            loss = -log_alpha[T - 1, U - 1]
+            
+            # Ensure indices are valid (handle edge case where T or U might be 0)
+            T_idx = max(0, min(T - 1, log_alpha.size(0) - 1))
+            U_idx = max(0, min(U - 1, log_alpha.size(1) - 1))
+            
+            loss = -log_alpha[T_idx, U_idx]
             losses.append(loss)
         
         # Apply reduction
@@ -118,10 +121,8 @@ class TransducerLoss(nn.Module):
             return torch.tensor(losses, device=logits.device)
         elif self.reduction == "mean":
             return torch.mean(torch.tensor(losses, device=logits.device))
-        elif self.reduction == "sum":
+        else:  # sum
             return torch.sum(torch.tensor(losses, device=logits.device))
-        else:
-            raise ValueError(f"Unknown reduction: {self.reduction}")
     
     def _compute_forward_variables(
         self,
