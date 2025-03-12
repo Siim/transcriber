@@ -10,8 +10,8 @@ from tqdm import tqdm
 import numpy as np
 from dataclasses import dataclass, field
 
-from ..model.transducer import XLSRTransducer
-from .loss import TransducerLossWrapper
+from model.transducer import XLSRTransducer
+from training.loss import TransducerLossWrapper
 
 
 @dataclass
@@ -566,4 +566,117 @@ def levenshtein_distance(seq1: List[int], seq2: List[int]) -> int:
                     distance[i - 1][j - 1] + 1,  # Substitution
                 )
     
-    return distance[m][n] 
+    return distance[m][n]
+
+# Add a proper adapter class
+class Trainer:
+    """
+    Adapter class for the XLSRTransducerTrainer to match the expected interface
+    from the train_by_stages.py script.
+    """
+    
+    def __init__(self, config, device, resume_checkpoint=None):
+        """
+        Initialize the trainer adapter.
+        
+        Args:
+            config: Configuration dictionary
+            device: Device to run on ("cuda" or "cpu")
+            resume_checkpoint: Optional path to a checkpoint to resume from
+        """
+        from model.transducer import XLSRTransducer
+        from data.dataset import ASRDataset
+        from torch.utils.data import DataLoader
+        
+        self.config = config
+        self.device = device
+        self.resume_checkpoint = resume_checkpoint
+        
+        # Create model
+        model_config = config.get("model", {})
+        self.model = XLSRTransducer(
+            encoder_params=model_config.get("encoder_params", {}),
+            predictor_params=model_config.get("predictor_params", {}),
+            joint_params=model_config.get("joint_params", {})
+        ).to(device)
+        
+        # Create datasets
+        data_config = config.get("data", {})
+        train_dataset = ASRDataset(
+            manifest_path=data_config.get("train_manifest", ""),
+            audio_dir=data_config.get("audio_dir", ""),
+            sample_rate=data_config.get("sample_rate", 16000),
+            max_duration=data_config.get("max_duration", 30.0),
+            min_duration=data_config.get("min_duration", 0.5),
+            max_samples=config.get("training", {}).get("max_train_samples", None)
+        )
+        
+        eval_dataset = ASRDataset(
+            manifest_path=data_config.get("valid_manifest", ""),
+            audio_dir=data_config.get("audio_dir", ""),
+            sample_rate=data_config.get("sample_rate", 16000),
+            max_duration=data_config.get("max_duration", 30.0),
+            min_duration=data_config.get("min_duration", 0.5),
+            max_samples=config.get("training", {}).get("max_eval_samples", None)
+        )
+        
+        # Create dataloaders
+        batch_size = data_config.get("batch_size", 2)
+        num_workers = data_config.get("num_workers", 4)
+        
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=train_dataset.collate_fn
+        )
+        
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=eval_dataset.collate_fn
+        )
+        
+        # Create training arguments
+        training_config = config.get("training", {})
+        args = TrainingArguments(
+            output_dir=training_config.get("checkpoint_dir", "checkpoints"),
+            log_dir=training_config.get("log_dir", "logs"),
+            num_epochs=training_config.get("epochs", 10),
+            learning_rate=training_config.get("learning_rate", 1e-5),
+            weight_decay=training_config.get("weight_decay", 1e-6),
+            warmup_steps=training_config.get("warmup_steps", 5000),
+            grad_clip=training_config.get("grad_clip", 0.5),
+            log_interval=training_config.get("log_interval", 100),
+            eval_interval=training_config.get("eval_interval", 1000),
+            save_interval=training_config.get("save_interval", 5000),
+            early_stopping_patience=training_config.get("early_stopping_patience", 5),
+            scheduler=training_config.get("scheduler", "constant"),
+            use_fp16=training_config.get("use_fp16", False),
+            device=device
+        )
+        
+        # Create the actual trainer
+        self.trainer = XLSRTransducerTrainer(
+            model=self.model,
+            train_dataloader=train_dataloader,
+            eval_dataloader=eval_dataloader,
+            args=args
+        )
+        
+        # Load checkpoint if provided
+        if resume_checkpoint is not None and os.path.exists(resume_checkpoint):
+            self.trainer.load_checkpoint(resume_checkpoint)
+    
+    def train(self):
+        """Run training and return the path to the best checkpoint."""
+        results = self.trainer.train()
+        
+        # Return the path to the best checkpoint
+        output_dir = self.trainer.args.output_dir
+        best_model_path = os.path.join(output_dir, "best_model.pt")
+        
+        return best_model_path 
