@@ -49,6 +49,7 @@ training:
   save_dir: "checkpoints"
   log_dir: "logs"
   output_dir: "outputs"
+  device: "cuda"
   log_interval: 100
   eval_interval: 1000
   save_interval: 5000
