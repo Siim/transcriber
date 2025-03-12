@@ -45,6 +45,11 @@ class TransducerJoint(nn.Module):
         
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, vocab_size)
+        
+        # Initialize weights with smaller values to prevent exploding gradients
+        nn.init.xavier_uniform_(self.encoder_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.predictor_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
     
     def forward(
         self,
@@ -61,6 +66,10 @@ class TransducerJoint(nn.Module):
         Returns:
             Joint outputs of shape (batch_size, time_steps, label_length, vocab_size)
         """
+        # Check for NaN values in inputs
+        if torch.isnan(encoder_outputs).any() or torch.isnan(predictor_outputs).any():
+            print("WARNING: NaN values detected in joint network inputs!")
+            
         # Project encoder outputs
         encoder_proj = self.encoder_proj(encoder_outputs)  # (batch_size, time_steps, hidden_dim)
         
@@ -81,6 +90,13 @@ class TransducerJoint(nn.Module):
         # Project to vocabulary
         outputs = self.output_proj(joint)  # (batch_size, time_steps, label_length, vocab_size)
         
+        # Scale outputs to prevent extreme values
+        outputs = outputs * 0.1
+        
+        # Check for NaN values in outputs
+        if torch.isnan(outputs).any():
+            print("WARNING: NaN values detected in joint network outputs!")
+            
         return outputs
     
     def forward_step(
@@ -113,5 +129,8 @@ class TransducerJoint(nn.Module):
         
         # Project to vocabulary
         output = self.output_proj(joint)  # (batch_size, vocab_size)
+        
+        # Scale outputs to prevent extreme values
+        output = output * 0.1
         
         return output 

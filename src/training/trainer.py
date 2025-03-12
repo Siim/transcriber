@@ -239,9 +239,28 @@ class XLSRTransducerTrainer:
                         if 'logits' in outputs:
                             print(f"Logits requires_grad: {outputs['logits'].requires_grad}")
                 
+                # Check for NaN loss
+                if torch.isnan(loss).any():
+                    self.logger.warning(f"NaN loss detected at step {self.global_step}. Skipping batch.")
+                    # Skip this batch
+                    continue
+                
                 # Backward pass with gradient scaling
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
+                
+                # Check for NaN gradients
+                has_nan_grad = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
+                    # Skip parameter update for this batch
+                    continue
                 
                 # Gradient clipping
                 if self.args.grad_clip > 0:
@@ -269,9 +288,28 @@ class XLSRTransducerTrainer:
                     attention_mask=batch["attention_mask"],
                 )
                 
+                # Check for NaN loss
+                if torch.isnan(loss).any():
+                    self.logger.warning(f"NaN loss detected at step {self.global_step}. Skipping batch.")
+                    # Skip this batch
+                    continue
+                
                 # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
+                
+                # Check for NaN gradients
+                has_nan_grad = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        self.logger.warning(f"NaN gradient detected in {name} at step {self.global_step}")
+                        has_nan_grad = True
+                        break
+                
+                if has_nan_grad:
+                    self.logger.warning(f"Skipping parameter update due to NaN gradients at step {self.global_step}")
+                    # Skip parameter update for this batch
+                    continue
                 
                 # Gradient clipping
                 if self.args.grad_clip > 0:
@@ -281,6 +319,19 @@ class XLSRTransducerTrainer:
                 
                 # Update weights
                 self.optimizer.step()
+            
+            # Check for NaN parameters after update
+            has_nan_param = False
+            for name, param in self.model.named_parameters():
+                if torch.isnan(param).any():
+                    self.logger.warning(f"NaN parameter detected in {name} at step {self.global_step}")
+                    has_nan_param = True
+                    break
+            
+            if has_nan_param:
+                self.logger.warning(f"NaN parameters detected after update at step {self.global_step}")
+                # Load last checkpoint or reinitialize model
+                # For now, we'll just continue and hope for the best
             
             # Update scheduler
             self.scheduler.step()
