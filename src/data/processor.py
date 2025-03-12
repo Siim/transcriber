@@ -77,6 +77,77 @@ class CharacterTokenizer:
         return len(self.vocab)
 
 
+class BPETokenizer:
+    """BPE tokenizer for Estonian language using HuggingFace's transformers."""
+    
+    def __init__(self, tokenizer_dir: str = "data/tokenizer", special_tokens: Dict[str, str] = None):
+        """
+        Initialize the BPE tokenizer.
+        
+        Args:
+            tokenizer_dir: Directory containing the tokenizer files
+            special_tokens: Dictionary of special tokens
+        """
+        from transformers import PreTrainedTokenizerFast
+        import os
+        
+        if special_tokens is None:
+            special_tokens = {
+                "pad": "<pad>",
+                "unk": "<unk>",
+                "bos": "<s>",
+                "eos": "</s>",
+                "blank": "<blank>"
+            }
+        
+        self.special_tokens = special_tokens
+        self.special_tokens_list = list(special_tokens.values())
+        
+        # Check if tokenizer files exist
+        tokenizer_file = os.path.join(tokenizer_dir, "tokenizer.json")
+        if not os.path.exists(tokenizer_file):
+            raise FileNotFoundError(
+                f"Tokenizer file not found at {tokenizer_file}. "
+                "Run create_bpe_tokenizer.py to create the BPE tokenizer."
+            )
+        
+        # Load the tokenizer
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=tokenizer_file,
+            bos_token=special_tokens["bos"],
+            eos_token=special_tokens["eos"],
+            unk_token=special_tokens["unk"],
+            pad_token=special_tokens["pad"],
+        )
+        
+        # Add blank token if it's not already in the tokenizer
+        if special_tokens["blank"] not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({"additional_special_tokens": [special_tokens["blank"]]})
+        
+        # Map special token IDs
+        self.pad_id = self.tokenizer.convert_tokens_to_ids(special_tokens["pad"])
+        self.unk_id = self.tokenizer.convert_tokens_to_ids(special_tokens["unk"])
+        self.bos_id = self.tokenizer.convert_tokens_to_ids(special_tokens["bos"])
+        self.eos_id = self.tokenizer.convert_tokens_to_ids(special_tokens["eos"])
+        self.blank_id = self.tokenizer.convert_tokens_to_ids(special_tokens["blank"])
+        
+        # Create reverse mapping for decoding
+        self.id_to_token = {v: k for k, v in self.tokenizer.get_vocab().items()}
+    
+    def encode(self, text: str) -> List[int]:
+        """Convert text to token IDs."""
+        return self.tokenizer.encode(text.lower(), add_special_tokens=False)
+    
+    def decode(self, token_ids: List[int], skip_special_tokens: bool = True) -> str:
+        """Convert token IDs to text."""
+        return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+    
+    @property
+    def vocab_size(self) -> int:
+        """Return the size of the vocabulary."""
+        return len(self.tokenizer.get_vocab())
+
+
 @dataclass
 class AudioPreprocessor:
     """Audio preprocessing for XLSR-Transducer."""
@@ -169,12 +240,48 @@ class XLSRTransducerProcessor:
     
     def __init__(
         self,
-        tokenizer: Optional[CharacterTokenizer] = None,
+        tokenizer_type: str = "character",
+        tokenizer_dir: str = "data/tokenizer",
+        tokenizer: Optional[Union[CharacterTokenizer, BPETokenizer]] = None,
         audio_preprocessor: Optional[AudioPreprocessor] = None,
         sample_rate: int = 16000,
         max_duration: Optional[float] = None,
+        vocab_size: Optional[int] = None,
+        special_tokens: Optional[Dict[str, str]] = None,
     ):
-        self.tokenizer = tokenizer or CharacterTokenizer()
+        """
+        Initialize the XLSR-Transducer processor.
+        
+        Args:
+            tokenizer_type: Type of tokenizer to use ("character" or "bpe")
+            tokenizer_dir: Directory containing BPE tokenizer files (used if tokenizer_type="bpe")
+            tokenizer: Optional pre-initialized tokenizer
+            audio_preprocessor: Optional pre-initialized audio preprocessor
+            sample_rate: Audio sample rate
+            max_duration: Maximum duration of audio in seconds
+            vocab_size: Vocabulary size for BPE tokenizer
+            special_tokens: Dictionary of special tokens
+        """
+        # Set up tokenizer based on type if not provided
+        if tokenizer is None:
+            if tokenizer_type.lower() == "bpe":
+                try:
+                    self.tokenizer = BPETokenizer(
+                        tokenizer_dir=tokenizer_dir,
+                        special_tokens=special_tokens
+                    )
+                    print(f"Using BPE tokenizer with vocab size {self.tokenizer.vocab_size}")
+                except FileNotFoundError as e:
+                    print(f"Warning: {str(e)}")
+                    print("Falling back to character tokenizer. Run create_bpe_tokenizer.py to create the BPE tokenizer.")
+                    self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
+            else:  # default to character tokenizer
+                self.tokenizer = CharacterTokenizer(special_tokens=special_tokens)
+                print(f"Using character tokenizer with vocab size {self.tokenizer.vocab_size}")
+        else:
+            self.tokenizer = tokenizer
+        
+        # Set up audio preprocessor
         self.audio_preprocessor = audio_preprocessor or AudioPreprocessor(sample_rate=sample_rate)
         self.max_duration = max_duration
     
