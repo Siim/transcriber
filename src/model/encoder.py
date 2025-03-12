@@ -157,13 +157,17 @@ class StreamingWav2Vec2Attention(nn.Module):
         
         # Apply attention mask if provided
         if attention_mask is not None:
-            # Ensure the mask is correctly shaped for addition to attention weights
+            # First, ensure attention_mask is 2D (batch_size, seq_len)
+            if attention_mask.dim() > 2:
+                attention_mask = attention_mask.squeeze()  # Remove extra dimensions
+            
+            # Convert mask from [batch_size, seq_len] -> [batch_size, 1, 1, seq_len]
+            # Then expand to [batch_size, num_heads, seq_len, seq_len]
             expanded_attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            expanded_attn_mask = expanded_attn_mask.expand(bsz, self.num_heads, seq_len, seq_len)
-            expanded_attn_mask = (1.0 - expanded_attn_mask) * -10000.0
+            expanded_attn_mask = (1.0 - expanded_attn_mask) * -10000.0  # Convert 0s to -10000, 1s to 0
             
             attn_weights = attn_weights.view(bsz, self.num_heads, seq_len, seq_len)
-            attn_weights = attn_weights + expanded_attn_mask
+            attn_weights = attn_weights + expanded_attn_mask.expand(-1, self.num_heads, seq_len, -1)
             attn_weights = attn_weights.view(bsz * self.num_heads, seq_len, seq_len)
         
         # Apply softmax and dropout
