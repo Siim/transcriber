@@ -95,6 +95,9 @@ class TransducerLoss(nn.Module):
         batch_size = logits.size(0)
         losses = []
         
+        # Create a zero tensor to accumulate losses (keeps grad connection)
+        total_loss = torch.zeros(1, device=logits.device, requires_grad=True)
+        
         for b in range(batch_size):
             # Get sample data
             sample_logits = logits[b, :logit_lengths[b], :label_lengths[b] + 1, :]
@@ -113,16 +116,21 @@ class TransducerLoss(nn.Module):
             T_idx = max(0, min(T - 1, log_alpha.size(0) - 1))
             U_idx = max(0, min(U - 1, log_alpha.size(1) - 1))
             
+            # Directly accumulate the loss to maintain gradient flow
             loss = -log_alpha[T_idx, U_idx]
-            losses.append(loss)
+            total_loss = total_loss + loss
+            losses.append(loss.detach())  # For tracking only
         
-        # Apply reduction
-        if self.reduction == "none":
-            return torch.tensor(losses, device=logits.device)
-        elif self.reduction == "mean":
-            return torch.mean(torch.tensor(losses, device=logits.device))
-        else:  # sum
-            return torch.sum(torch.tensor(losses, device=logits.device))
+        # Average the loss if needed
+        if self.reduction == "mean":
+            total_loss = total_loss / batch_size
+        elif self.reduction == "none":
+            # For "none" reduction, we need to return individual losses
+            # In this case, we have to recreate a tensor with grad
+            stacked_losses = torch.stack([loss.clone() for loss in losses])
+            return stacked_losses
+            
+        return total_loss
     
     def _compute_forward_variables(
         self,
@@ -142,9 +150,10 @@ class TransducerLoss(nn.Module):
         T, U, _ = logits.size()
         U = U - 1  # Adjust for blank
         
-        # Initialize forward variables
+        # Initialize forward variables with -inf
         log_alpha = torch.full((T, U + 1), float("-inf"), device=logits.device)
-        log_alpha[0, 0] = 0.0
+        # Set initial value directly to maintain gradient connection
+        log_alpha[0, 0] = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
         
         # Compute forward variables
         for t in range(T):
@@ -152,17 +161,28 @@ class TransducerLoss(nn.Module):
                 if t == 0 and u == 0:
                     continue
                 
+                # Initialize the current position
+                current_value = torch.tensor(float("-inf"), device=logits.device, dtype=logits.dtype)
+                
                 # Probability of emitting blank
                 if t > 0:
                     blank_prob = logits[t - 1, u, self.blank_id]
-                    log_alpha[t, u] = log_alpha[t - 1, u] + blank_prob
+                    # Use logaddexp to avoid numerical issues while maintaining gradient
+                    current_value = torch.logaddexp(
+                        current_value, 
+                        log_alpha[t - 1, u] + blank_prob
+                    )
                 
                 # Probability of emitting label
                 if u > 0:
                     label_prob = logits[t, u - 1, labels[u - 1]]
-                    log_alpha[t, u] = torch.logaddexp(
-                        log_alpha[t, u], log_alpha[t, u - 1] + label_prob
+                    current_value = torch.logaddexp(
+                        current_value,
+                        log_alpha[t, u - 1] + label_prob
                     )
+                
+                # Set the value
+                log_alpha[t, u] = current_value
         
         return log_alpha
 
@@ -202,7 +222,15 @@ class TransducerLossWrapper(nn.Module):
         Returns:
             Loss value
         """
+        # Ensure outputs is a dictionary and has logits
+        if not isinstance(outputs, dict) or "logits" not in outputs:
+            raise ValueError(f"Expected outputs to be a dictionary with 'logits' key, got {type(outputs)}")
+            
         logits = outputs["logits"]
+        
+        # Check if logits requires grad
+        if not logits.requires_grad:
+            print("WARNING: logits does not require gradients. This will result in no parameter updates.")
         
         # Compute logit lengths from attention mask
         if attention_mask is not None:
@@ -220,4 +248,8 @@ class TransducerLossWrapper(nn.Module):
             label_lengths=label_lengths,
         )
         
+        # Ensure loss requires grad (debug information)
+        if not loss.requires_grad:
+            print("WARNING: Computed loss does not require gradients!")
+            
         return loss 

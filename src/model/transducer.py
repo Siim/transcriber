@@ -117,6 +117,10 @@ class XLSRTransducer(nn.Module):
                 predictor_outputs=predictor_hidden_states,
             )
             
+            # Debug: Check if logits require gradients
+            if not logits.requires_grad:
+                print("WARNING: Logits do not require gradients after joint network forward pass!")
+            
             return {
                 "logits": logits,
                 "encoder_outputs": encoder_hidden_states,

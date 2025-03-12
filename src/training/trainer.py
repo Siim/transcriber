@@ -181,6 +181,25 @@ class XLSRTransducerTrainer:
         """
         self.model.train()
         
+        # Debugging: Check if model parameters require gradients
+        param_requires_grad = {}
+        for name, param in self.model.named_parameters():
+            param_requires_grad[name] = param.requires_grad
+        
+        # Count trainable parameters
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        non_trainable_params = sum(p.numel() for p in self.model.parameters() if not p.requires_grad)
+        print(f"Trainable parameters: {trainable_params:,}")
+        print(f"Non-trainable parameters: {non_trainable_params:,}")
+        
+        # Print a few key parameters to check
+        if 'encoder.model.feature_extractor.conv_layers.0.conv.weight' in param_requires_grad:
+            print(f"Encoder feature extractor requires_grad: {param_requires_grad['encoder.model.feature_extractor.conv_layers.0.conv.weight']}")
+        if 'predictor.embedding.weight' in param_requires_grad:
+            print(f"Predictor embedding requires_grad: {param_requires_grad['predictor.embedding.weight']}")
+        if 'joint.output_proj.weight' in param_requires_grad:
+            print(f"Joint output_proj requires_grad: {param_requires_grad['joint.output_proj.weight']}")
+        
         total_loss = 0.0
         num_batches = len(self.train_dataloader)
         start_time = time.time()
@@ -213,6 +232,12 @@ class XLSRTransducerTrainer:
                         label_lengths=batch["label_lengths"],
                         attention_mask=batch["attention_mask"],
                     )
+                    
+                    # Check if loss requires gradient
+                    if batch_idx == 0:
+                        print(f"Loss requires_grad: {loss.requires_grad}")
+                        if 'logits' in outputs:
+                            print(f"Logits requires_grad: {outputs['logits'].requires_grad}")
                 
                 # Backward pass with gradient scaling
                 self.optimizer.zero_grad()
