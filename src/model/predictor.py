@@ -77,8 +77,14 @@ class TransducerPredictor(nn.Module):
         
         # Validate label_lengths - with detailed diagnostics
         if label_lengths is not None:
-            print(f"DEBUG: label_lengths min: {label_lengths.min().item()}, max: {label_lengths.max().item()}, shape: {label_lengths.shape}")
-            print(f"DEBUG: labels shape: {labels.shape}")
+            try:
+                min_length = label_lengths.min().item() if hasattr(label_lengths, 'min') else str(label_lengths)
+                max_length = label_lengths.max().item() if hasattr(label_lengths, 'max') else str(label_lengths)
+                print(f"DEBUG: label_lengths min: {min_length}, max: {max_length}, shape: {label_lengths.shape if hasattr(label_lengths, 'shape') else 'unknown'}")
+                print(f"DEBUG: labels shape: {labels.shape}")
+            except Exception as e:
+                print(f"DEBUG: Error printing label_lengths info: {e}")
+                print(f"DEBUG: label_lengths type: {type(label_lengths)}")
             
             # Ensure label_lengths is at least 1 for each batch item
             if (label_lengths <= 0).any():
