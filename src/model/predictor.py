@@ -72,6 +72,19 @@ class TransducerPredictor(nn.Module):
         # Check for NaN values in input
         if torch.isnan(labels.float()).any():
             print("WARNING: NaN values detected in predictor input!")
+            labels = torch.nan_to_num(labels.float(), nan=0.0).long()
+        
+        # Validate label_lengths
+        if label_lengths is not None:
+            # Ensure label_lengths is at least 1 for each batch item
+            if (label_lengths <= 0).any():
+                print("WARNING: Some label lengths are zero or negative. Setting them to 1.")
+                label_lengths = torch.clamp(label_lengths, min=1)
+                
+            # Ensure label_lengths doesn't exceed max_label_length
+            if (label_lengths > max_label_length).any():
+                print(f"WARNING: Some label lengths exceed max_label_length ({max_label_length}). Clamping.")
+                label_lengths = torch.clamp(label_lengths, max=max_label_length)
         
         # Embed labels
         embedded = self.embedding(labels)  # (batch_size, max_label_length, embedding_dim)
@@ -79,31 +92,36 @@ class TransducerPredictor(nn.Module):
         
         # Pack sequence if label_lengths is provided
         if label_lengths is not None:
-            # Sort sequences by length for packing
-            sorted_lengths, indices = torch.sort(label_lengths, descending=True)
-            embedded = embedded[indices]
-            
-            # Pack sequence
-            packed = nn.utils.rnn.pack_padded_sequence(
-                embedded, sorted_lengths.cpu(), batch_first=True
-            )
-            
-            # Forward through LSTM
-            outputs, hidden = self.lstm(packed, hidden)
-            
-            # Unpack sequence
-            outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
-            
-            # Restore original order
-            _, reverse_indices = torch.sort(indices)
-            outputs = outputs[reverse_indices]
-            
-            # Restore hidden state order
-            if hidden is not None:
-                h, c = hidden
-                h = h[:, reverse_indices]
-                c = c[:, reverse_indices]
-                hidden = (h, c)
+            try:
+                # Sort sequences by length for packing
+                sorted_lengths, indices = torch.sort(label_lengths, descending=True)
+                embedded = embedded[indices]
+                
+                # Pack sequence
+                packed = nn.utils.rnn.pack_padded_sequence(
+                    embedded, sorted_lengths.cpu(), batch_first=True
+                )
+                
+                # Forward through LSTM
+                outputs, hidden = self.lstm(packed, hidden)
+                
+                # Unpack sequence
+                outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
+                
+                # Restore original order
+                _, reverse_indices = torch.sort(indices)
+                outputs = outputs[reverse_indices]
+                
+                # Restore hidden state order
+                if hidden is not None:
+                    h, c = hidden
+                    h = h[:, reverse_indices]
+                    c = c[:, reverse_indices]
+                    hidden = (h, c)
+            except Exception as e:
+                print(f"WARNING: Error in packing sequence: {e}. Falling back to unpacked version.")
+                # Forward through LSTM without packing as a fallback
+                outputs, hidden = self.lstm(embedded, hidden)
         else:
             # Forward through LSTM without packing
             outputs, hidden = self.lstm(embedded, hidden)
@@ -120,6 +138,7 @@ class TransducerPredictor(nn.Module):
         # Check for NaN values in output
         if torch.isnan(outputs).any():
             print("WARNING: NaN values detected in predictor output!")
+            outputs = torch.nan_to_num(outputs, nan=0.0)
         
         return {
             "outputs": outputs,

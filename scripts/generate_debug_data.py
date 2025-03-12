@@ -6,31 +6,33 @@ Creates fake manifest files with sample entries for training, validation, and te
 
 import os
 import argparse
+import random
+import string
 
 
-def generate_debug_manifest(output_path, num_samples=100):
-    """
-    Generate a placeholder manifest file for testing.
+def generate_random_text(length=50):
+    """Generate random Estonian text for debugging."""
+    # Basic Estonian characters
+    chars = list("abcdefghijklmnopqrsšzžtuvwõäöüxy") + [" "] * 10
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
+def generate_debug_manifest(manifest_path, num_samples=100):
+    """Generate a debug manifest file with fake data."""
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
     
-    Args:
-        output_path: Path to save the manifest file
-        num_samples: Number of sample entries to generate
-    """
-    # Ensure output directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        for i in range(num_samples):
+            # Generate fake paths and texts
+            sample_id = f"{i:04d}"
+            audio_path = f"samples/sample_{sample_id}.wav"
+            text = generate_random_text(random.randint(10, 100))
+            speaker_id = f"speaker_{i % 10:02d}"
+            
+            # Write to manifest
+            f.write(f"{audio_path}|{text}|{speaker_id}\n")
     
-    # Create fake audio paths and transcriptions
-    lines = []
-    for i in range(num_samples):
-        # Format: /path/to/audio.wav|transcription|speaker_id
-        line = f"samples/sample_{i:04d}.wav|See test järjekordne näidis lause number {i}.|speaker_{i % 10:02d}\n"
-        lines.append(line)
-    
-    # Write to file
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    
-    print(f"Generated {num_samples} sample entries in {output_path}")
+    print(f"Debug manifest generated at {manifest_path} with {num_samples} samples")
 
 
 def main():
@@ -53,4 +55,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Generate debug manifests for train, valid, and test sets
+    data_dir = "data/manifests"
+    os.makedirs(data_dir, exist_ok=True)
+    
+    generate_debug_manifest(os.path.join(data_dir, "train_debug.lst"), 100)
+    generate_debug_manifest(os.path.join(data_dir, "valid_debug.lst"), 20)
+    generate_debug_manifest(os.path.join(data_dir, "test_debug.lst"), 10)
+    
     main() 

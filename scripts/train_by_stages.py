@@ -123,24 +123,37 @@ def run_stage(stage_id, args, main_config, stages_config):
         config["training"]["eval_every_n_steps"] = 20
         logger.info("Debug mode enabled: Using reduced dataset and more frequent logging")
         
+        # Override manifest paths for debug mode
+        debug_manifest_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "manifests")
+        os.makedirs(debug_manifest_dir, exist_ok=True)
+        
+        train_manifest = os.path.join(debug_manifest_dir, "train_debug.lst")
+        valid_manifest = os.path.join(debug_manifest_dir, "valid_debug.lst")
+        test_manifest = os.path.join(debug_manifest_dir, "test_debug.lst")
+        
         # Generate debug data if needed
-        if not os.path.exists(config["data"]["train_manifest"]):
+        if not os.path.exists(train_manifest):
             logger.info("Generating debug data files...")
             from scripts.generate_debug_data import generate_debug_manifest
             
             # Generate manifest files
-            generate_debug_manifest(config["data"]["train_manifest"], 100)
-            generate_debug_manifest(config["data"]["valid_manifest"], 50)
-            generate_debug_manifest(config["data"]["test_manifest"], 20)
+            generate_debug_manifest(train_manifest, 100)
+            generate_debug_manifest(valid_manifest, 20)
+            generate_debug_manifest(test_manifest, 10)
             
             # Create samples directory if it doesn't exist
-            samples_dir = os.path.join(os.path.dirname(config["data"]["train_manifest"]), "samples")
+            samples_dir = os.path.join(debug_manifest_dir, "samples")
             os.makedirs(samples_dir, exist_ok=True)
             
             logger.info("Debug data generation complete")
+        
+        # Update config to use debug manifests
+        config["data"]["train_manifest"] = train_manifest
+        config["data"]["valid_manifest"] = valid_manifest
+        config["data"]["test_manifest"] = test_manifest
     
     # Create trainer
-    trainer = Trainer(config, device, resume_checkpoint=resume_checkpoint)
+    trainer = Trainer(config, device, resume_checkpoint=resume_checkpoint, debug=args.debug)
     
     # Run training
     best_model_path = trainer.train()

@@ -577,7 +577,7 @@ class Trainer:
     from the train_by_stages.py script.
     """
     
-    def __init__(self, config, device, resume_checkpoint=None):
+    def __init__(self, config, device, resume_checkpoint=None, debug=False):
         """
         Initialize the trainer adapter.
         
@@ -585,15 +585,28 @@ class Trainer:
             config: Configuration dictionary
             device: Device to run on ("cuda" or "cpu")
             resume_checkpoint: Optional path to a checkpoint to resume from
+            debug: Whether to run in debug mode
         """
         from model.transducer import XLSRTransducer
         from data.dataset import EstonianASRDataset, collate_fn
         from data.processor import XLSRTransducerProcessor
         from torch.utils.data import DataLoader
+        import logging
         
         self.config = config
         self.device = device
         self.resume_checkpoint = resume_checkpoint
+        self.debug = debug
+        
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO if not debug else logging.DEBUG,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        if debug:
+            self.logger.info("Debug mode enabled - using reduced dataset and more frequent logging")
         
         # Get tokenizer configuration
         tokenizer_config = config.get("tokenizer", {})
@@ -636,32 +649,104 @@ class Trainer:
         
         # Create datasets
         data_config = config.get("data", {})
+        
+        # Modify dataset configuration for debug mode
+        if debug:
+            self.logger.info("Debug mode: Using a small subset of data for faster iteration")
+            # Use the first 100 examples for training and 20 for validation in debug mode
+            max_train_samples = min(100, data_config.get("max_train_samples", 100))
+            max_eval_samples = min(20, data_config.get("max_eval_samples", 20))
+        else:
+            max_train_samples = None
+            max_eval_samples = None
+        
         self.train_dataset = EstonianASRDataset(
             manifest_path=data_config.get("train_manifest", ""),
             processor=self.processor,
             audio_dir=data_config.get("audio_dir", ""),
             max_duration=data_config.get("max_duration", 30.0),
-            min_duration=data_config.get("min_duration", 0.5)
+            min_duration=data_config.get("min_duration", 0.5),
+            debug=debug
         )
+        
+        # Limit dataset size in debug mode
+        if max_train_samples is not None and max_train_samples < len(self.train_dataset):
+            self.logger.info(f"Debug mode: Limiting training dataset to {max_train_samples} samples")
+            self.train_dataset.samples = self.train_dataset.samples[:max_train_samples]
         
         self.eval_dataset = EstonianASRDataset(
             manifest_path=data_config.get("valid_manifest", ""),
             processor=self.processor,
             audio_dir=data_config.get("audio_dir", ""),
             max_duration=data_config.get("max_duration", 30.0),
-            min_duration=data_config.get("min_duration", 0.5)
+            min_duration=data_config.get("min_duration", 0.5),
+            debug=debug
         )
+        
+        # Limit dataset size in debug mode
+        if max_eval_samples is not None and max_eval_samples < len(self.eval_dataset):
+            self.logger.info(f"Debug mode: Limiting evaluation dataset to {max_eval_samples} samples")
+            self.eval_dataset.samples = self.eval_dataset.samples[:max_eval_samples]
+        
+        # Validate dataset sizes
+        if len(self.train_dataset) == 0:
+            raise ValueError("Training dataset is empty. Check manifest path and audio files.")
+        
+        if len(self.eval_dataset) == 0:
+            raise ValueError("Evaluation dataset is empty. Check manifest path and audio files.")
+        
+        self.logger.info(f"Training dataset size: {len(self.train_dataset)}")
+        self.logger.info(f"Evaluation dataset size: {len(self.eval_dataset)}")
+        
+        # Get custom collate function that handles variable length inputs and labels
+        def robust_collate_fn(batch):
+            """
+            Enhanced collate function that handles potential errors in batches.
+            """
+            import torch
+            
+            # Filter out any problematic samples
+            valid_batch = []
+            for sample in batch:
+                # Check if all required keys are present and not empty
+                if all(k in sample and sample[k] is not None for k in ["input_values", "labels", "speaker_id"]):
+                    if sample["input_values"].numel() > 0 and sample["labels"].numel() > 0:
+                        valid_batch.append(sample)
+                    else:
+                        self.logger.warning(f"Skipping sample with empty tensors: {sample.keys()}")
+                else:
+                    self.logger.warning(f"Skipping sample with missing keys: {sample.keys()}")
+            
+            # If we have no valid samples, create a dummy batch with minimal inputs
+            if len(valid_batch) == 0:
+                self.logger.warning(f"No valid samples in batch, creating dummy batch")
+                dummy_sample = {
+                    "input_values": torch.zeros(1, 16000),  # 1 second at 16kHz
+                    "labels": torch.tensor([self.processor.blank_id], dtype=torch.long),
+                    "speaker_id": torch.tensor([0], dtype=torch.long)
+                }
+                valid_batch = [dummy_sample, dummy_sample]  # Need at least 2 for batch
+            
+            # Use the original collate function with the valid batch
+            return collate_fn(valid_batch)
         
         # Create dataloaders
         batch_size = data_config.get("batch_size", 2)
         num_workers = data_config.get("num_workers", 4)
+        
+        # For debug mode, use smaller batch size and fewer workers
+        if debug:
+            batch_size = min(batch_size, 2)
+            num_workers = min(num_workers, 2)
+            self.logger.info(f"Debug mode: Using batch_size={batch_size}, num_workers={num_workers}")
         
         train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            collate_fn=collate_fn
+            collate_fn=robust_collate_fn,
+            pin_memory=True
         )
         
         eval_dataloader = DataLoader(
@@ -669,11 +754,24 @@ class Trainer:
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=collate_fn
+            collate_fn=robust_collate_fn,
+            pin_memory=True
         )
         
         # Create training arguments
         training_config = config.get("training", {})
+        
+        # Adjust training parameters for debug mode
+        if debug:
+            log_interval = 1
+            eval_interval = 5
+            save_interval = 10
+            self.logger.info(f"Debug mode: Using modified training parameters for faster iterations")
+        else:
+            log_interval = training_config.get("log_interval", 100)
+            eval_interval = training_config.get("eval_interval", 1000)
+            save_interval = training_config.get("save_interval", 5000)
+        
         args = TrainingArguments(
             output_dir=training_config.get("checkpoint_dir", "checkpoints"),
             log_dir=training_config.get("log_dir", "logs"),
@@ -682,9 +780,9 @@ class Trainer:
             weight_decay=training_config.get("weight_decay", 1e-6),
             warmup_steps=training_config.get("warmup_steps", 5000),
             grad_clip=training_config.get("grad_clip", 0.5),
-            log_interval=training_config.get("log_interval", 100),
-            eval_interval=training_config.get("eval_interval", 1000),
-            save_interval=training_config.get("save_interval", 5000),
+            log_interval=log_interval,
+            eval_interval=eval_interval,
+            save_interval=save_interval,
             early_stopping_patience=training_config.get("early_stopping_patience", 5),
             scheduler=training_config.get("scheduler", "constant"),
             use_fp16=training_config.get("use_fp16", False),

@@ -125,6 +125,10 @@ class AudioPreprocessor:
     ) -> Dict[str, torch.Tensor]:
         """Process audio file to input features."""
         try:
+            # Check if file exists
+            if not os.path.exists(audio_path):
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+                
             # Load audio
             waveform, sample_rate = torchaudio.load(audio_path)
             
@@ -137,6 +141,9 @@ class AudioPreprocessor:
             # Generate 2 seconds of silence at the target sample rate
             sample_rate = self.sample_rate
             waveform = torch.zeros(1, 2 * sample_rate)
+            
+            # Add a tiny bit of noise to prevent NaN in feature extractors
+            waveform = waveform + torch.randn_like(waveform) * 1e-6
         
         # Trim to max_duration if specified
         if max_duration is not None:
@@ -171,9 +178,36 @@ class XLSRTransducerProcessor:
         self.audio_preprocessor = audio_preprocessor or AudioPreprocessor(sample_rate=sample_rate)
         self.max_duration = max_duration
     
-    def process_audio(self, audio_path: str) -> Dict[str, torch.Tensor]:
-        """Process audio file."""
-        return self.audio_preprocessor(audio_path, self.max_duration)
+    def process_audio(self, audio_path: Optional[str] = None, audio: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """Process audio file or tensor."""
+        if audio is not None:
+            # Process audio tensor directly
+            if audio.dim() == 1:
+                # Add batch dimension if needed
+                audio = audio.unsqueeze(0)
+            
+            # Verify audio tensor
+            audio = self.audio_preprocessor._verify_audio(audio, self.audio_preprocessor.sample_rate, "direct_tensor")
+            
+            # Trim to max_duration if specified
+            if self.max_duration is not None:
+                max_samples = int(self.max_duration * self.audio_preprocessor.sample_rate)
+                if audio.shape[1] > max_samples:
+                    audio = audio[:, :max_samples]
+            
+            # Convert to numpy array
+            audio_np = audio.squeeze().numpy()
+            
+            # Process with feature extractor
+            return self.audio_preprocessor.feature_extractor(
+                audio_np, 
+                sampling_rate=self.audio_preprocessor.sample_rate, 
+                return_tensors="pt"
+            )
+        elif audio_path is not None:
+            return self.audio_preprocessor(audio_path, self.max_duration)
+        else:
+            raise ValueError("Either audio_path or audio must be provided")
     
     def process_text(self, text: str) -> List[int]:
         """Process text to token IDs."""
@@ -181,11 +215,15 @@ class XLSRTransducerProcessor:
     
     def __call__(
         self, 
-        audio_path: str, 
+        audio_path: Optional[str] = None,
+        audio: Optional[torch.Tensor] = None,
         text: Optional[str] = None
     ) -> Dict[str, torch.Tensor]:
         """Process both audio and text."""
-        result = self.process_audio(audio_path)
+        if audio_path is None and audio is None:
+            raise ValueError("Either audio_path or audio must be provided")
+            
+        result = self.process_audio(audio_path=audio_path, audio=audio)
         
         if text is not None:
             result["labels"] = torch.tensor(self.process_text(text))

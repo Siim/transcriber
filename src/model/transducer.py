@@ -106,6 +106,16 @@ class XLSRTransducer(nn.Module):
         
         # Predictor forward pass (if labels are provided)
         if labels is not None and label_lengths is not None:
+            # Validate label_lengths to prevent CUDA errors
+            if (label_lengths <= 0).any():
+                print("WARNING: Some label lengths are zero or negative. Setting them to 1.")
+                label_lengths = torch.clamp(label_lengths, min=1)
+                
+            # Ensure label_lengths doesn't exceed labels.size(1)
+            if (label_lengths > labels.size(1)).any():
+                print(f"WARNING: Some label lengths exceed labels dimension {labels.size(1)}. Clamping.")
+                label_lengths = torch.clamp(label_lengths, max=labels.size(1))
+                
             # Shift labels right by adding blank at the beginning
             blank_tensor = torch.full(
                 (labels.size(0), 1), self.blank_id, dtype=labels.dtype, device=labels.device
