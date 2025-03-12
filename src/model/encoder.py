@@ -530,36 +530,49 @@ class XLSREncoder(nn.Module):
                 extract_features.shape[1], attention_mask, add_adapter=False
             )
         
+        # Apply feature projection
         hidden_states = self.model.feature_projection(extract_features)
         
-        # Run the encoder part - handle return value carefully
-        try:
-            # Call encoder
-            encoder_outputs = self.model.encoder(hidden_states, attention_mask=attention_mask)
-            
-            # Process outputs based on the returned type
-            if isinstance(encoder_outputs, tuple):
-                # For tuple output (common in newer HF versions)
-                hidden_states = encoder_outputs[0]  # First element is hidden states
-            elif hasattr(encoder_outputs, 'last_hidden_state'):
-                # For BaseModelOutput type
-                hidden_states = encoder_outputs.last_hidden_state
-            else:
-                # For direct tensor output
-                hidden_states = encoder_outputs
-        except Exception as e:
-            print(f"Error in encoder forward: {e}")
-            # Fallback: if we've already extracted encoder_outputs and it's a tuple
-            if 'encoder_outputs' in locals() and isinstance(encoder_outputs, tuple) and len(encoder_outputs) > 0:
-                hidden_states = encoder_outputs[0]
-            else:
-                raise  # Re-raise if we can't recover
+        # MODIFIED: Instead of calling the encoder directly, we'll process each layer manually
+        # to avoid the issue with hidden_states being a tuple
         
+        # Apply position embeddings if available
+        if hasattr(self.model.encoder, "pos_conv_embed"):
+            hidden_states = self.model.encoder.pos_conv_embed(hidden_states)
+            
+        # Apply layer norm if available
+        if hasattr(self.model.encoder, "layer_norm"):
+            hidden_states = self.model.encoder.layer_norm(hidden_states)
+            
+        # Apply dropout if available
+        if hasattr(self.model.encoder, "dropout"):
+            hidden_states = self.model.encoder.dropout(hidden_states)
+        
+        # Process through each encoder layer
+        encoder_states = () if hasattr(self.model.encoder, "layers") else None
+        
+        # Process through encoder layers
+        for layer in self.model.encoder.layers:
+            if self.training and layer.dropout.p > 0:
+                # Apply layerdrop if training
+                dropout_probability = torch.rand(())
+                if dropout_probability > self.model.encoder.layerdrop:
+                    hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
+            else:
+                hidden_states, _ = layer(hidden_states, attention_mask=attention_mask)
+                
+            if encoder_states is not None:
+                encoder_states = encoder_states + (hidden_states,)
+        
+        # Handle final layer norm if available
+        if hasattr(self.model.encoder, "layer_norm"):
+            hidden_states = self.model.encoder.layer_norm(hidden_states)
+            
         # Check for NaN values in hidden states
         if torch.isnan(hidden_states).any():
             print("WARNING: NaN values detected in encoder hidden states!")
             hidden_states = torch.nan_to_num(hidden_states, nan=0.0)
-        
+            
         # Apply layer normalization for stability
         last_hidden_state = self.output_layer_norm(hidden_states)
         
@@ -574,5 +587,5 @@ class XLSREncoder(nn.Module):
         
         return {
             "last_hidden_state": last_hidden_state,
-            "hidden_states": None if not output_hidden_states else hidden_states,
+            "hidden_states": encoder_states if output_hidden_states else None,
         } 
