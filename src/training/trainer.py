@@ -697,6 +697,17 @@ class Trainer:
         # Get processor configuration
         processor_config = config.get("processor", {})
         
+        # Add tokenizer configuration to processor config
+        if "type" in tokenizer_config:
+            processor_config["tokenizer_type"] = tokenizer_config["type"]
+        if "vocab_size" in tokenizer_config:
+            processor_config["vocab_size"] = tokenizer_config["vocab_size"]
+        if "special_tokens" in tokenizer_config:
+            processor_config["special_tokens"] = tokenizer_config["special_tokens"]
+        
+        # Add tokenizer directory
+        processor_config["tokenizer_dir"] = tokenizer_config.get("dir", "data/tokenizer")
+        
         # Create processor
         self.processor = XLSRTransducerProcessor(**processor_config)
         
