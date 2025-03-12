@@ -122,6 +122,22 @@ def run_stage(stage_id, args, main_config, stages_config):
         config["training"]["log_every_n_steps"] = 5
         config["training"]["eval_every_n_steps"] = 20
         logger.info("Debug mode enabled: Using reduced dataset and more frequent logging")
+        
+        # Generate debug data if needed
+        if not os.path.exists(config["data"]["train_manifest"]):
+            logger.info("Generating debug data files...")
+            from scripts.generate_debug_data import generate_debug_manifest
+            
+            # Generate manifest files
+            generate_debug_manifest(config["data"]["train_manifest"], 100)
+            generate_debug_manifest(config["data"]["valid_manifest"], 50)
+            generate_debug_manifest(config["data"]["test_manifest"], 20)
+            
+            # Create samples directory if it doesn't exist
+            samples_dir = os.path.join(os.path.dirname(config["data"]["train_manifest"]), "samples")
+            os.makedirs(samples_dir, exist_ok=True)
+            
+            logger.info("Debug data generation complete")
     
     # Create trainer
     trainer = Trainer(config, device, resume_checkpoint=resume_checkpoint)

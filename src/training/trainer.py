@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 
 from model.transducer import XLSRTransducer
 from training.loss import TransducerLossWrapper
+from data.dataset import EstonianASRDataset, collate_fn
+from data.processor import XLSRTransducerProcessor
 
 
 @dataclass
@@ -585,39 +587,69 @@ class Trainer:
             resume_checkpoint: Optional path to a checkpoint to resume from
         """
         from model.transducer import XLSRTransducer
-        from data.dataset import ASRDataset
+        from data.dataset import EstonianASRDataset, collate_fn
+        from data.processor import XLSRTransducerProcessor
         from torch.utils.data import DataLoader
         
         self.config = config
         self.device = device
         self.resume_checkpoint = resume_checkpoint
         
+        # Get tokenizer configuration
+        tokenizer_config = config.get("tokenizer", {})
+        
+        # Set vocabulary size and blank ID
+        # For character tokenizer, we'll use a default size of 60 as mentioned in the config comments
+        vocab_size = tokenizer_config.get("vocab_size", 60)
+        
+        # Get the blank token index (typically the last token in the vocabulary)
+        blank_id = vocab_size - 1
+        
+        # Initialize joint network parameters if they don't exist
+        if "joint_params" not in config.get("model", {}):
+            config["model"]["joint_params"] = {}
+        
+        # Make sure hidden_dim is set for the joint network
+        if "hidden_dim" not in config["model"]["joint_params"]:
+            # Look for hidden_dim in the joint section of config
+            joint_config = config.get("model", {}).get("joint", {})
+            if "hidden_dim" in joint_config:
+                config["model"]["joint_params"]["hidden_dim"] = joint_config["hidden_dim"]
+            else:
+                # Default to 640 as shown in the config file
+                config["model"]["joint_params"]["hidden_dim"] = 640
+        
         # Create model
-        model_config = config.get("model", {})
         self.model = XLSRTransducer(
-            encoder_params=model_config.get("encoder_params", {}),
-            predictor_params=model_config.get("predictor_params", {}),
-            joint_params=model_config.get("joint_params", {})
+            vocab_size=vocab_size,
+            blank_id=blank_id,
+            encoder_params=config["model"].get("encoder_params", {}),
+            predictor_params=config["model"].get("predictor_params", {}),
+            joint_params=config["model"]["joint_params"]
         ).to(device)
+        
+        # Get processor configuration
+        processor_config = config.get("processor", {})
+        
+        # Create processor
+        self.processor = XLSRTransducerProcessor(**processor_config)
         
         # Create datasets
         data_config = config.get("data", {})
-        train_dataset = ASRDataset(
+        self.train_dataset = EstonianASRDataset(
             manifest_path=data_config.get("train_manifest", ""),
+            processor=self.processor,
             audio_dir=data_config.get("audio_dir", ""),
-            sample_rate=data_config.get("sample_rate", 16000),
             max_duration=data_config.get("max_duration", 30.0),
-            min_duration=data_config.get("min_duration", 0.5),
-            max_samples=config.get("training", {}).get("max_train_samples", None)
+            min_duration=data_config.get("min_duration", 0.5)
         )
         
-        eval_dataset = ASRDataset(
+        self.eval_dataset = EstonianASRDataset(
             manifest_path=data_config.get("valid_manifest", ""),
+            processor=self.processor,
             audio_dir=data_config.get("audio_dir", ""),
-            sample_rate=data_config.get("sample_rate", 16000),
             max_duration=data_config.get("max_duration", 30.0),
-            min_duration=data_config.get("min_duration", 0.5),
-            max_samples=config.get("training", {}).get("max_eval_samples", None)
+            min_duration=data_config.get("min_duration", 0.5)
         )
         
         # Create dataloaders
@@ -625,19 +657,19 @@ class Trainer:
         num_workers = data_config.get("num_workers", 4)
         
         train_dataloader = DataLoader(
-            train_dataset,
+            self.train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            collate_fn=train_dataset.collate_fn
+            collate_fn=collate_fn
         )
         
         eval_dataloader = DataLoader(
-            eval_dataset,
+            self.eval_dataset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=eval_dataset.collate_fn
+            collate_fn=collate_fn
         )
         
         # Create training arguments
