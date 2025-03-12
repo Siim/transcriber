@@ -108,7 +108,7 @@ class XLSRTransducerTrainer:
             self.scheduler = scheduler
         
         # Set up scaler for mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler() if self.args.use_fp16 else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.args.use_fp16 else None
         
         # Set up logging
         logging.basicConfig(
@@ -199,7 +199,7 @@ class XLSRTransducerTrainer:
             
             # Forward pass with mixed precision
             if self.args.use_fp16:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = self.model(
                         input_values=batch["input_values"],
                         attention_mask=batch["attention_mask"],

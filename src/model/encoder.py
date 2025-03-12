@@ -161,29 +161,48 @@ class StreamingWav2Vec2Attention(nn.Module):
             # Debug: print the shape
             print(f"Original attention_mask shape: {attention_mask.shape}")
             
-            # Ensure we have a 2D attention mask [batch_size, seq_len]
-            if attention_mask.dim() > 2:
-                # Flatten all extra dimensions
-                while attention_mask.dim() > 2:
-                    attention_mask = attention_mask.squeeze(1)
-                print(f"Squeezed attention_mask shape: {attention_mask.shape}")
-            
-            # Create a 4D attention mask [batch_size, 1, 1, seq_len]
-            expanded_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            print(f"Expanded mask shape after unsqueeze: {expanded_mask.shape}")
-            
-            # Create attention mask where 0s -> -10000.0 and 1s -> 0.0
-            attention_mask_float = (1.0 - expanded_mask) * -10000.0
-            print(f"Final attention_mask_float shape: {attention_mask_float.shape}")
-            
-            # Reshape attention weights to 4D [batch_size, num_heads, seq_len, seq_len]
-            attn_weights_4d = attn_weights.view(bsz, self.num_heads, seq_len, seq_len)
-            
-            # Add the mask to the attention weights
-            attn_weights_4d = attn_weights_4d + attention_mask_float
-            
-            # Reshape back to 3D [batch_size * num_heads, seq_len, seq_len]
-            attn_weights = attn_weights_4d.view(bsz * self.num_heads, seq_len, seq_len)
+            # For the specific case of [batch_size, 1, seq_len, seq_len]
+            if attention_mask.dim() == 4 and attention_mask.shape[1] == 1:
+                # If the mask is already in the correct format, just use it directly
+                attention_mask_float = (1.0 - attention_mask) * -10000.0
+                
+                # Reshape attention weights to 4D [batch_size, num_heads, seq_len, seq_len]
+                attn_weights_4d = attn_weights.view(bsz, self.num_heads, seq_len, seq_len)
+                
+                # Expand the mask to match the number of heads
+                attention_mask_expanded = attention_mask_float.expand(-1, self.num_heads, -1, -1)
+                print(f"Expanded attention mask shape: {attention_mask_expanded.shape}")
+                
+                # Add the mask to the attention weights
+                attn_weights_4d = attn_weights_4d + attention_mask_expanded
+                
+                # Reshape back to 3D [batch_size * num_heads, seq_len, seq_len]
+                attn_weights = attn_weights_4d.view(bsz * self.num_heads, seq_len, seq_len)
+            else:
+                # Handle other shapes as before
+                # Ensure we have a 2D attention mask [batch_size, seq_len]
+                if attention_mask.dim() > 2:
+                    # Flatten all extra dimensions
+                    while attention_mask.dim() > 2:
+                        attention_mask = attention_mask.squeeze(1)
+                    print(f"Squeezed attention_mask shape: {attention_mask.shape}")
+                
+                # Create a 4D attention mask [batch_size, 1, 1, seq_len]
+                expanded_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                print(f"Expanded mask shape after unsqueeze: {expanded_mask.shape}")
+                
+                # Create attention mask where 0s -> -10000.0 and 1s -> 0.0
+                attention_mask_float = (1.0 - expanded_mask) * -10000.0
+                print(f"Final attention_mask_float shape: {attention_mask_float.shape}")
+                
+                # Reshape attention weights to 4D [batch_size, num_heads, seq_len, seq_len]
+                attn_weights_4d = attn_weights.view(bsz, self.num_heads, seq_len, seq_len)
+                
+                # Add the mask to the attention weights
+                attn_weights_4d = attn_weights_4d + attention_mask_float
+                
+                # Reshape back to 3D [batch_size * num_heads, seq_len, seq_len]
+                attn_weights = attn_weights_4d.view(bsz * self.num_heads, seq_len, seq_len)
         
         # Apply softmax and dropout
         attn_weights = F.softmax(attn_weights, dim=-1)
