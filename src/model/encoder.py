@@ -531,7 +531,13 @@ class XLSREncoder(nn.Module):
             )
         
         # Apply feature projection
-        hidden_states = self.model.feature_projection(extract_features)
+        feature_projection_output = self.model.feature_projection(extract_features)
+        
+        # Handle the feature projection output which might be a tuple
+        if isinstance(feature_projection_output, tuple):
+            hidden_states = feature_projection_output[0]
+        else:
+            hidden_states = feature_projection_output
         
         # MODIFIED: Instead of calling the encoder directly, we'll process each layer manually
         # to avoid the issue with hidden_states being a tuple
